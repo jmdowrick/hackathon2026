@@ -159,10 +159,17 @@ def exact_graph(grid, F, D, temperature=298.0, max_states=6):
     if not edges:
         return None
 
+    # per-edge saddle: the feature that actually governs kappa
+    from .barrier import minimax_barrier
+    sad = minimax_barrier(F, grid, [int(c) for c in centres])
+    E = np.array(edges)
+    saddle = np.array([sad[i, j] for i, j in E])
+
     return {
         "centres": pts[centres], "F": Fs, "K_ce": Kc,
-        "edges": np.array(edges), "kappa": np.array(kappa),
-        "D": D, "rate_matrix": K,
+        "edges": E, "kappa": np.array(kappa),
+        "D": D, "rate_matrix": K, "saddle": saddle,
+        "grid_cell_area": grid.cell_area, "grid_h": float(grid.h[0]),
     }
 
 
@@ -205,13 +212,30 @@ def node_features(rec):
     ], axis=1)
 
 
-def edge_geometry(rec):
-    """Symmetric geometric features per edge: torus separation."""
+def edge_geometry(rec, use_barrier=False):
+    """Symmetric edge features. Every column is invariant under swapping the
+    two endpoints, which is what keeps kappa symmetric by construction.
+
+    use_barrier adds the saddle descriptors. Those are the features that can
+    actually inform kappa (ln kappa ~ ln D - beta F_dagger); without them the
+    network is being asked to predict a barrier it has no information about.
+    """
     c = rec["centres"]
     e = rec["edges"]
     dv = (c[e[:, 1]] - c[e[:, 0]] + np.pi) % (2 * np.pi) - np.pi
     dist = np.linalg.norm(dv, axis=1, keepdims=True)
-    return np.concatenate([dist, np.abs(dv)], axis=1)   # |dv| is symmetric
+    feats = [dist, np.abs(dv)]                       # |dv| is symmetric
+
+    if use_barrier:
+        sad = np.asarray(rec["saddle"], dtype=float)
+        Fi, Fj = rec["F"][e[:, 0]], rec["F"][e[:, 1]]
+        feats += [
+            (sad / 10.0)[:, None],                              # F_dagger
+            ((sad - np.minimum(Fi, Fj)) / 10.0)[:, None],       # from deeper well
+            ((sad - np.maximum(Fi, Fj)) / 10.0)[:, None],       # from shallower
+        ]
+    out = np.concatenate(feats, axis=1)
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -263,17 +287,18 @@ class PHGNN(nn.Module):
         return log_K, log_kappa
 
 
-def _pack(rec, device):
+def _pack(rec, device, use_barrier=False):
     x = torch.tensor(node_features(rec), dtype=torch.float32, device=device)
     ei = torch.tensor(rec["edges"], dtype=torch.long, device=device)
-    ea = torch.tensor(edge_geometry(rec), dtype=torch.float32, device=device)
+    ea = torch.tensor(edge_geometry(rec, use_barrier),
+                      dtype=torch.float32, device=device)
     y = torch.tensor(np.log(np.clip(rec["kappa"], 1e-300, None)),
                      dtype=torch.float32, device=device)
     return x, ei, ea, y
 
 
 def train(dataset, steps=1500, lr=3e-3, hidden=48, rounds=2, seed=0,
-          val_frac=0.25, device=None, verbose=False):
+          val_frac=0.25, device=None, verbose=False, use_barrier=False):
     """Train on whole graphs; hold out whole graphs for the transfer test."""
     if not HAVE_TORCH:
         raise ImportError("PyTorch required")
@@ -287,12 +312,12 @@ def train(dataset, steps=1500, lr=3e-3, hidden=48, rounds=2, seed=0,
     trn = [dataset[i] for i in idx[n_val:]]
 
     nf = node_features(dataset[0]).shape[1]
-    ef = edge_geometry(dataset[0]).shape[1]
+    ef = edge_geometry(dataset[0], use_barrier).shape[1]
     model = PHGNN(nf, ef, hidden, rounds).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
 
-    packed_t = [_pack(r, device) for r in trn]
-    packed_v = [_pack(r, device) for r in val]
+    packed_t = [_pack(r, device, use_barrier) for r in trn]
+    packed_v = [_pack(r, device, use_barrier) for r in val]
 
     def loss_on(packs):
         tot, n = 0.0, 0
@@ -323,7 +348,7 @@ def train(dataset, steps=1500, lr=3e-3, hidden=48, rounds=2, seed=0,
     return model, trn, val, best
 
 
-def evaluate(model, graphs, device="cpu"):
+def evaluate(model, graphs, device="cpu", use_barrier=False):
     """RMSE in ln kappa on held-out graphs, plus the naive baseline.
 
     Baseline: predict ln kappa from the endpoint free energies alone, which is
@@ -332,7 +357,7 @@ def evaluate(model, graphs, device="cpu"):
     """
     pred, true, base_feat = [], [], []
     for r in graphs:
-        x, ei, ea, y = _pack(r, device)
+        x, ei, ea, y = _pack(r, device, use_barrier)
         with torch.no_grad():
             _, lk = model(x, ei, ea)
         pred.append(lk.cpu().numpy())

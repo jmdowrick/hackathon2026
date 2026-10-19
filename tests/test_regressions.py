@@ -807,3 +807,74 @@ def test_learned_landscape_recovers_the_barrier_within_RT():
         f"region); got {err:+.2f}. If this turns positive the sampling or the "
         "mask has changed and the GREST argument needs re-checking."
     )
+
+
+@pytest.mark.slow
+def test_barrier_features_rescue_kappa_transfer():
+    """The result that overturns the earlier negative finding.
+
+    Same architecture, same graphs, same split -- only the edge features
+    differ. The cheap-feature arm is the control and MUST do worse, otherwise
+    the comparison shows nothing.
+    """
+    from ala2bg import phgnn
+
+    ds = phgnn.make_dataset(n_graphs=140, n_grid=30, seed=2)
+    ds = [r for r in ds if np.isfinite(r["saddle"]).all()]
+    assert len(ds) > 60, f"only {len(ds)} usable graphs"
+
+    rng = np.random.default_rng(0)
+    idx = rng.permutation(len(ds))
+    nv = max(1, int(0.25 * len(ds)))
+    val = [ds[i] for i in idx[:nv]]
+
+    out = {}
+    for ub in (False, True):
+        m, _, _, _ = phgnn.train(ds, steps=900, hidden=32, rounds=2, seed=0,
+                                 use_barrier=ub)
+        out[ub] = phgnn.evaluate(m, val, use_barrier=ub)
+
+    cheap = out[False]["rmse_phgnn_ln_kappa"]
+    barr = out[True]["rmse_phgnn_ln_kappa"]
+    assert barr < cheap, (
+        f"barrier features did not help: {barr:.3f} vs {cheap:.3f}. "
+        "ln kappa ~ ln D - beta F_dagger, so if informing the model about the "
+        "saddle does not improve it, the dataset or the features are broken."
+    )
+    # and the gain must be real, not noise
+    assert barr < 0.85 * cheap, \
+        f"gain too small to be meaningful: {barr:.3f} vs {cheap:.3f}"
+
+
+@pytest.mark.slow
+def test_barrier_features_preserve_the_symmetry_guarantee():
+    """Adding barrier features must not break detailed balance.
+
+    Every barrier column (F_dagger, barrier from deeper/shallower well) is
+    symmetric in the two endpoints, so kappa stays symmetric. Verified on
+    perturbed weights, as for the cheap-feature case.
+    """
+    import torch
+    from ala2bg import phgnn
+
+    ds = phgnn.make_dataset(n_graphs=10, n_grid=30, seed=5)
+    ds = [r for r in ds if np.isfinite(r["saddle"]).all()]
+    assert ds
+    rec = ds[0]
+    nf = phgnn.node_features(rec).shape[1]
+    ef = phgnn.edge_geometry(rec, True).shape[1]
+
+    torch.manual_seed(0)
+    model = phgnn.PHGNN(nf, ef)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(torch.randn_like(p) * 0.5)
+
+    x = torch.tensor(phgnn.node_features(rec), dtype=torch.float32)
+    ei = torch.tensor(rec["edges"], dtype=torch.long)
+    ea = torch.tensor(phgnn.edge_geometry(rec, True), dtype=torch.float32)
+    with torch.no_grad():
+        _, a = model(x, ei, ea)
+        _, b = model(x, ei.flip(1), ea)
+    scale = float(torch.maximum(a.abs(), b.abs()).max().clamp(min=1.0))
+    assert float((a - b).abs().max()) / scale < 1e-5
