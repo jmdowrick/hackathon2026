@@ -1046,3 +1046,95 @@ def test_conductance_is_in_a_physiological_range():
     bg = _k_channel()
     g = bg.conductance(bg.reversal_potential()) * 1e12
     assert 1.0 < g < 1000.0, f"conductance {g:.3g} pS is not physiological"
+
+
+# ---------------------------------------------------------------------------
+# KcsA: literature landscape + D measured from the project's own MD.
+# ---------------------------------------------------------------------------
+
+def test_barrier_parameter_equals_the_realised_barrier():
+    """A parameter must mean what it is named.
+
+    The first version summed Gaussian wells AND a corrugation, so a nominal
+    10.5 kJ/mol realised 12.7 and silently left the published 8.4-12.6 range.
+    """
+    from ala2bg import kcsa
+    for target in (8.4, 10.5, 12.6):
+        assert abs(kcsa.realised_barrier(target) - target) < 1e-6
+
+
+def test_published_range_check_can_fail():
+    from ala2bg import kcsa
+    assert kcsa.check_against_published(10.5)["in_range"]
+    assert not kcsa.check_against_published(25.0)["in_range"], \
+        "a barrier far outside the published range was accepted"
+
+
+def test_filter_D_recovers_a_known_diffusivity():
+    """Non-vacuous: the synthetic trajectory has a D we chose."""
+    from ala2bg import kcsa
+    rng = np.random.default_rng(0)
+    D_true, dt, n_f = 0.02, 1.0, 30_000
+    Z = np.empty((n_f, 3)); Z[0] = [-6.6, 0.0, 6.6]
+    for t in range(1, n_f):
+        Z[t] = np.clip(Z[t - 1] + np.sqrt(2 * D_true * dt)
+                       * rng.standard_normal(3), -12, 12)
+    r = kcsa.measure_filter_D(Z, dt)
+    assert r["available"]
+    assert abs(r["D_global"] - D_true) / D_true < 0.05
+
+
+def test_ions_leaving_the_filter_are_excluded():
+    """A pair spanning an entry or exit is not a diffusive step.
+
+    Built so the naive estimator (which keeps those pairs) is visibly wrong:
+    one ion teleports far outside the window between frames.
+    """
+    from ala2bg import kcsa
+    dt = 1.0
+    n = 4000
+    rng = np.random.default_rng(1)
+    Z = np.cumsum(np.sqrt(2 * 0.01 * dt) * rng.standard_normal((n, 1)), axis=0)
+    Z = np.clip(Z, -8.0, 8.0)
+    Z_bad = Z.copy()
+    Z_bad[n // 2] = 500.0                  # an excursion far outside
+
+    good = kcsa.measure_filter_D(Z_bad, dt)["D_global"]
+    naive = float(np.mean(np.diff(Z_bad[:, 0]) ** 2) / (2 * dt))
+    assert naive > 100 * good, "naive estimator not actually broken; test weak"
+    assert abs(good - 0.01) / 0.01 < 0.3
+
+
+def test_permeation_graph_is_thermodynamically_consistent():
+    from ala2bg import kcsa
+    bg = kcsa.permeation_graph(0.02)
+    assert bg.check_charge_closure()["closes"]
+    assert bg.check_nernst(140.0, 4.0)["ok"]
+    assert abs(bg.reversal_potential() * 1000 + 91.3) < 0.2
+    g = bg.conductance(bg.reversal_potential()) * 1e12
+    assert 1.0 < g < 2000.0, f"conductance {g:.3g} pS not physiological"
+
+
+def test_permeation_graph_carries_its_provenance():
+    """Which half came from where must travel with the artifact."""
+    from ala2bg import kcsa
+    bg = kcsa.permeation_graph(0.02)
+    assert bg.meta["F_source"].startswith("literature")
+    assert "measured" in bg.meta["D_source"]
+    assert "NOT digitised" in bg.meta["F_detail"]
+    assert "forcefield_caveat" in bg.meta
+
+
+def test_pore_axis_is_computed_not_assumed():
+    """A tilted filter must give a tilted axis, or the ion coordinate is
+    projected onto the wrong direction."""
+    from ala2bg.kcsa import filter_axis_from_positions
+    ring = np.array([[1., 0., 0.], [0., 1., 0.], [-1., 0., 0.], [0., -1., 0.]])
+    _, axis = filter_axis_from_positions(ring)
+    assert abs(abs(axis[2]) - 1.0) < 1e-9
+
+    th = np.radians(30)
+    R = np.array([[1, 0, 0], [0, np.cos(th), -np.sin(th)],
+                  [0, np.sin(th), np.cos(th)]])
+    _, axis_t = filter_axis_from_positions(ring @ R.T)
+    assert abs(axis_t[2] - np.cos(th)) < 1e-6, "tilt not detected"

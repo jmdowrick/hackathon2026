@@ -35,6 +35,73 @@ Results land in `runs/<name>/`: `results.json` (everything), `_manifest.json`
 
 ---
 
+## The current workflow
+
+Two tracks share one set of estimators. **Track A** (alanine dipeptide) is where
+the instrument is validated against exact ground truth. **Track B** (KcsA) is
+the application, and it splits the work differently because F and D have very
+different sampling requirements.
+
+```
+                        ┌─────────────────────────────────────────────┐
+                        │  TRACK A — validation (ala2, ground truth)  │
+                        └─────────────────────────────────────────────┘
+  MD / mdshare / toy
+        │
+        ├─► measure D ................ 2nd Kramers–Moyal moment, FROZEN
+        │
+        ├─► choose states ............ MSM spectral gap (minimal.py)
+        │                              measured, not argued: 1296 bins → 2–4 states
+        │
+        ├─► histogram FES ............ thermodynamic route to the landscape
+        │
+        ├─► PHNN learns H ............ 1st KM moment, D fixed  →  H over-determined
+        │                              H_kinetic vs F_thermodynamic = Markovianity test
+        │
+        ├─► barrier ................... minimax saddle by union–find (barrier.py)
+        │                              ln κ ≈ ln D − βF‡, so this is what sets rates
+        │
+        └─► bond graph ................ Ce/Re/0/1 → CellML 2.0, cycle + Wegscheider checks
+                                        cross-checked against an independent MSM
+
+                        ┌─────────────────────────────────────────────┐
+                        │  TRACK B — application (KcsA filter)        │
+                        └─────────────────────────────────────────────┘
+  F  ← literature .................... Bernèche & Roux: 2–3 kcal/mol max barrier,
+     (needs rare events: ~0.55 µs       2-ion↔3-ion knock-on. Parameterised to those
+      at +300 mV — out of reach)        published values, NOT digitised data.
+
+  D  ← this project's MD ............. only needs LOCAL displacements, so tens of ns
+     (closed gate is fine;              with zero permeation is enough
+      no permeation required)
+
+        └─► permeation_graph() ........ sites → electrogenic bond graph → I–V curve
+                                        validated: reversal = Nernst to ~1e-13 mV
+```
+
+**Why the split.** A KcsA permeation study sees ~90 conduction events per µs at
++300 mV, so 50 events needs ~0.55 µs — and every available structure
+(1BL8/1K4C/3EFF) is closed-gate, giving *zero* events unrestrained. F is
+therefore out of reach and comes from the literature. D needs only ions
+jiggling in the filter, which a short closed-gate run delivers. Every artifact
+records which half came from where (`kcsa.provenance()`).
+
+**The electrical port** follows Hunter et al. (bioRxiv 2024.06.26.600892):
+effort enters the 1-junction as `z_r F V`, flux gains `exp((z_r F V + A_r)/RT)`
+on the forward term, charge balances at a 0-node. Hunter's Figure 4 is
+single-step; permeation is not, so each hop carries only a *fraction* of the
+field, `z_r = z_ion(δ_j − δ_i)`, which telescopes around the cycle to exactly
+one charge — **charge closure is structural, not assumed**. That per-step
+coefficient is the family whole-cell models usually assume rather than measure.
+
+```bash
+make test                                   # 62 fast tests, ~5 s
+python -c "from ala2bg import kcsa; bg = kcsa.permeation_graph(0.02); \
+           print(bg.reversal_potential()*1000, 'mV')"     # -91.30 mV = E_K
+```
+
+---
+
 ## What it does, stage by stage
 
 ```
@@ -79,6 +146,13 @@ scalar potential, so `Ḣ = −∇Hᵀ D ∇H ≤ 0` identically, for *any* weig
 | the neural network, loss, training | `src/ala2bg/phnn.py` |
 | **>2 CVs / scalability** | `src/ala2bg/nd.py` |
 | MSM reference arm | `src/ala2bg/msm.py` |
+| minimal state set from the spectral gap | `src/ala2bg/minimal.py` |
+| saddle heights / transition-state features | `src/ala2bg/barrier.py` |
+| electrogenic bond graph, I-V curve | `src/ala2bg/electro.py` |
+| KcsA landscape + D from filter MD | `src/ala2bg/kcsa.py` |
+| arbitrary-period coordinates (ion z) | `src/ala2bg/periodic.py` |
+| learned-model surrogate dynamics | `src/ala2bg/surrogate.py` |
+| port-Hamiltonian graph network | `src/ala2bg/phgnn.py` |
 | F,D → generator (Bicout–Szabo) | `src/ala2bg/thermo/smoluchowski.py` |
 | committor, MFPT | `src/ala2bg/thermo/committor.py` |
 | Ce/Re components, cycle tests | `src/ala2bg/thermo/bondgraph.py` |
@@ -231,6 +305,19 @@ without the baseline column.**
   internally inconsistent — our own MSM gives a clean ITS plateau at ~1.4 ns.
 - `model_coarse.cellml` is validated by the master-equation round-trip test,
   **not** by OpenCOR. OpenCOR is presentation polish; don't let it block.
+- **The KcsA free-energy surface is parameterised, not measured.** It is
+  constrained to Bernèche & Roux's published 2-3 kcal/mol maximum barrier and
+  their 2-ion/3-ion mechanism; it is *not* digitised PMF data. Say
+  "consistent with the published PMF", never "the published PMF".
+- **Fixed-charge force fields underestimate KcsA conductance by ~2-10x**
+  (C36m 27.7 pS, C36m-NBFIX 64.0 pS, Amber 51.2 pS at +300 mV with the gate
+  restrained open, against ~100 pS experimental). NBFIX is *not* a reliable
+  fix — in the same study it made things worse at +200 mV. Declare the
+  caveat; do not spend the project trying to correct it. Absolute conductance
+  is indicative; the barrier and the diffusivity are the outputs with standing.
+- **A transferable kappa surrogate needs features about the BARRIER.** Endpoint
+  state free energies do not determine kappa (ln kappa ~ ln D - beta F‡), and
+  no architecture fixes a feature set that omits the saddle.
 
 ---
 
