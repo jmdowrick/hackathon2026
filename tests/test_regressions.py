@@ -719,3 +719,91 @@ def test_kappa_is_governed_by_the_saddle_not_the_endpoints():
         "ever reaches ~1 the benchmark has become degenerate and the "
         "'cheap features predict kappa' conclusion would be an artefact"
     )
+
+
+# ---------------------------------------------------------------------------
+# BARRIER: the feature that actually governs kappa, and whether a LEARNED
+# landscape resolves it well enough to skip path sampling.
+# ---------------------------------------------------------------------------
+
+def test_minimax_barrier_is_exact_on_a_known_landscape():
+    """Union-find flooding must find the true saddle, not a straight-line max.
+
+    Built so a straight-line interpolation between the two minima would give a
+    DIFFERENT (higher) answer: the low path goes around, not across.
+    """
+    from ala2bg import barrier
+    g = TorusGrid(40, 40)
+    pts = g.center_grid()
+    # two wells in phi, with a wall that is high at psi=0 and low at psi=pi
+    F = 6.0 * (1 + np.cos(2 * pts[:, 0]))
+    wall = 20.0 * np.exp(-((pts[:, 0]) ** 2) / 0.1) * np.exp(-(pts[:, 1] ** 2) / 0.5)
+    F = F + wall
+    F -= F.min()
+
+    cen = barrier.basins_from_landscape(F, g, max_states=3, min_separation=1.0)
+    assert len(cen) >= 2
+    sad = barrier.minimax_barrier(F, g, cen)
+    s = np.nanmin(sad[np.isfinite(sad)])
+
+    # the true low path detours around the wall, so the saddle is ~12 (the
+    # plain double-well barrier), NOT ~32 (through the wall)
+    assert s < 16.0, f"minimax barrier {s:.1f} looks like a straight-line path"
+    # and it must not be below the actual barrier
+    assert s > 8.0, f"minimax barrier {s:.1f} is below the true well barrier"
+
+
+def test_minimax_barrier_detects_disconnection():
+    from ala2bg import barrier
+    g = TorusGrid(20, 20)
+    F = np.full(g.n_bins, np.nan)
+    pts = g.center_grid()
+    left = np.abs(pts[:, 0] + 2.0) < 0.5
+    right = np.abs(pts[:, 0] - 2.0) < 0.5
+    F[left] = 0.0
+    F[right] = 0.0            # two islands, nothing between them
+    cen = np.array([np.flatnonzero(left)[0], np.flatnonzero(right)[0]])
+    sad = barrier.minimax_barrier(F, g, cen)
+    assert not np.isfinite(sad[0, 1]), "unconnected basins must give NaN"
+
+
+@pytest.mark.slow
+def test_learned_landscape_recovers_the_barrier_within_RT():
+    """The claim that makes kappa reachable without path sampling.
+
+    A learned H must put the saddle within ~RT of the truth. The error is
+    expected to be NEGATIVE (the barrier top is the least-sampled region), so
+    the test pins both the magnitude and the sign of the bias.
+    """
+    from ala2bg import barrier, diffusion, fes, phnn
+    from ala2bg.data import toy_potential
+    from ala2bg.thermo.smoluchowski import rt
+
+    bar, D = 12.0, 0.01
+    d = simulate_toy(n_steps=120_000, n_traj=8, dt=0.5, D=D, barrier=bar, seed=1)
+    X, dt, tid = d["X"], d["dt"], d["traj_id"]
+    g = TorusGrid(40, 40)
+    pts = g.center_grid()
+
+    Ft = toy_potential(pts, bar); Ft -= Ft.min()
+    cen_t = barrier.basins_from_landscape(Ft, g, max_states=4, min_separation=1.0)
+    s_true = float(np.nanmax(barrier.minimax_barrier(Ft, g, cen_t)))
+
+    Dm = diffusion.measure_D(X, dt, tid, lag=1)["D_const"]
+    m, _, _ = phnn.train_binned(X, dt, Dm, g, traj_id=tid, steps=2500, min_count=25)
+    H = phnn.evaluate_H(m, pts)
+    _, counts, mask = fes.histogram_fes(X, g, min_count=25)
+    cen = barrier.basins_from_landscape(np.where(mask, H, np.nan), g,
+                                        max_states=4, min_separation=1.0)
+    sad = barrier.minimax_barrier(np.where(mask, H, np.nan), g, cen)
+    assert np.isfinite(sad).any(), "no saddle found on the learned landscape"
+    s_learn = float(np.nanmax(sad))
+
+    err = s_learn - s_true
+    assert abs(err) < rt(298.0), \
+        f"learned saddle off by {err:+.2f} kJ/mol, more than RT"
+    assert err < 0.5, (
+        "the barrier-top bias is expected to be negative (least-sampled "
+        f"region); got {err:+.2f}. If this turns positive the sampling or the "
+        "mask has changed and the GREST argument needs re-checking."
+    )
