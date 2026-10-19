@@ -1138,3 +1138,114 @@ def test_pore_axis_is_computed_not_assumed():
                   [0, np.sin(th), np.cos(th)]])
     _, axis_t = filter_axis_from_positions(ring @ R.T)
     assert abs(axis_t[2] - np.cos(th)) < 1e-6, "tilt not detected"
+
+
+# ---------------------------------------------------------------------------
+# CellML: must VALIDATE with libcellml, and the emitted NUMBERS must reproduce
+# the Python model. Validation alone is not enough -- declaring J/mol values
+# as kJ/mol is internally consistent and silently wrong by 1000x.
+# ---------------------------------------------------------------------------
+
+def _emitted_values(path):
+    import xml.etree.ElementTree as ET
+    ns = {"c": "http://www.cellml.org/cellml/2.0#"}
+    root = ET.parse(path).getroot()
+    out = {}
+    for var in root.findall(".//c:component/c:variable", ns):
+        iv = var.get("initial_value")
+        if iv is not None:
+            out[var.get("name")] = (float(iv), var.get("units"))
+    return out
+
+
+def test_cellml_validates_with_libcellml():
+    """Pins three bugs that each made the output unloadable or wrong."""
+    from ala2bg import kcsa
+    from ala2bg.thermo.cellml_writer import validate_cellml, write_cellml
+    import tempfile, os
+
+    bg = kcsa.permeation_graph(0.02)
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "m.cellml")
+        write_cellml(bg, p, max_states=12)
+        issues = validate_cellml(p)
+        assert issues == [], f"CellML did not validate: {issues[:5]}"
+
+        text = open(p).read()
+        # 1. MathML must be the default namespace, not a prefix
+        assert '<math xmlns="http://www.w3.org/1998/Math/MathML">' in text
+        assert "<math:math" not in text
+        # 2. protected standard units must not be redefined
+        assert '<units name="mole"' not in text
+        assert '<units name="second"' not in text
+        # 3. kappa carries the units of v, since (K q) is dimensionless
+        vals = _emitted_values(p)
+        assert vals["kappa_0"][1] == "mol_per_s"
+        assert vals["K_S4"][1] == "per_mole"
+
+
+def test_cellml_numbers_match_the_python_model():
+    """The check validation cannot do: recompute the flux from the EMITTED
+    values, in the EMITTED units, and compare with the model.
+
+    This is what catches an affinity written in J/mol but declared kJ/mol --
+    dimensionally consistent, validates cleanly, wrong by a factor of 1000.
+    """
+    from ala2bg import kcsa
+    from ala2bg.thermo.cellml_writer import write_cellml
+    import tempfile, os
+
+    bg = kcsa.permeation_graph(0.02)
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "m.cellml")
+        write_cellml(bg, p, max_states=12)
+        vals = _emitted_values(p)
+
+    RT = vals["RT"][0]                 # kJ/mol
+    Far = vals["Far"][0]               # kJ/(mol V)
+    lab = bg.labels
+    q = np.array([vals[f"q_{l}"][0] for l in lab])
+    K = np.array([vals[f"K_{l}"][0] for l in lab])
+
+    for V in (0.0, -0.05, 0.05):
+        v_emitted = []
+        for r, (a, b) in enumerate(bg.edges):
+            z = vals[f"z_{r}"][0]
+            A = vals.get(f"A_{r}", (0.0, None))[0]       # kJ/mol
+            drive = (z * Far * V + A) / RT
+            v_emitted.append(vals[f"kappa_{r}"][0]
+                             * (K[a] * q[a] * np.exp(drive) - K[b] * q[b]))
+        v_model = bg.fluxes(q, V)
+        assert np.allclose(v_emitted, v_model, rtol=1e-9, atol=1e-30), (
+            f"emitted CellML fluxes disagree with the model at V={V}: "
+            f"{np.array(v_emitted)} vs {v_model}")
+
+
+def test_cellml_carries_the_electrical_port():
+    from ala2bg import kcsa
+    from ala2bg.thermo.cellml_writer import write_cellml
+    import tempfile, os
+    bg = kcsa.permeation_graph(0.02)
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "m.cellml")
+        write_cellml(bg, p, max_states=12)
+        t = open(p).read()
+    for frag in ('name="V" units="volt"', 'name="I" units="ampere"',
+                 'name="z_0"', "F_C"):
+        assert frag in t, f"missing {frag} -- electrical port not emitted"
+
+
+def test_writer_refuses_to_emit_invalid_cellml():
+    """The guard must fire, or validation is decorative."""
+    from ala2bg.thermo import cellml_writer as cw
+    from ala2bg import kcsa
+    import tempfile, os
+    bg = kcsa.permeation_graph(0.02)
+    orig = cw._UNIT_DEFS.copy()
+    try:
+        cw._UNIT_DEFS["mol_per_s"] = [("not_a_real_unit", {})]
+        with tempfile.TemporaryDirectory() as d:
+            with pytest.raises(ValueError):
+                cw.write_cellml(bg, os.path.join(d, "bad.cellml"), max_states=12)
+    finally:
+        cw._UNIT_DEFS.clear(); cw._UNIT_DEFS.update(orig)
