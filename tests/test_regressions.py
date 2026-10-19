@@ -949,3 +949,100 @@ def test_angles_feed_the_existing_torus_machinery_unchanged():
     assert fourier_features(TH).shape == (200, spec.n_features)
     d = wrapped_delta(TH[1:], TH[:-1])
     assert np.abs(d).max() <= np.pi + 1e-12
+
+
+# ---------------------------------------------------------------------------
+# ELECTROGENIC BOND GRAPH (Hunter et al. formulation).
+# ---------------------------------------------------------------------------
+
+def _k_channel(c_in=140.0, c_out=4.0, k=2e8, deltas=(0., .25, .5, .75)):
+    from ala2bg.electro import (ElectroBondGraph, bath_affinity,
+                                electrical_distances, reaction_charges)
+    edges = np.array([[0, 1], [1, 2], [2, 3], [3, 0]])
+    delta = electrical_distances(np.array(deltas), 0.0, 1.0)
+    z = reaction_charges(delta, edges, z_ion=1.0)
+    A = np.zeros(4); A[3] = bath_affinity(c_in, c_out)
+    return ElectroBondGraph.from_rates(np.full(4, k), np.full(4, k), edges, z,
+                                       affinity=A)
+
+
+def test_reversal_potential_reproduces_nernst():
+    """Hunter's validation, and it is NOT a restatement.
+
+    reversal_potential() is solved numerically from the assembled bond graph;
+    nernst() is the closed-form answer. They agree only if the per-reaction
+    charge coefficients close correctly around the cycle.
+    """
+    for c_in, c_out in [(1., 1.), (10., 1.), (1., 10.), (140., 4.), (1., 100.)]:
+        bg = _k_channel(c_in, c_out)
+        r = bg.check_nernst(c_in, c_out)
+        assert r["ok"], f"{c_in}/{c_out}: {r}"
+        assert abs(r["diff_mV"]) < 1e-6
+
+
+def test_physiological_potassium_gives_textbook_EK():
+    bg = _k_channel(140.0, 4.0)
+    assert abs(bg.reversal_potential() * 1000 + 91.3) < 0.2
+
+
+def test_a_flipped_orientation_is_caught():
+    """The failure mode that is easy to wave through: right magnitude, wrong
+    sign. If check_nernst cannot catch it, it is not testing anything."""
+    from ala2bg.electro import bath_affinity
+    bg = _k_channel(140.0, 4.0)
+    bad = _k_channel(4.0, 140.0)          # bath affinity inverted
+    good_V = bg.reversal_potential()
+    bad_V = bad.reversal_potential()
+    assert abs(abs(bad_V) - abs(good_V)) < 1e-9, "magnitudes should match"
+    assert np.sign(bad_V) != np.sign(good_V), "sign should flip"
+    assert not bad.check_nernst(140.0, 4.0)["ok"], \
+        "an inverted orientation passed the Nernst check"
+
+
+def test_charge_closure_is_enforced_not_assumed():
+    """sum of per-reaction z around the cycle must equal the ion valence."""
+    from ala2bg.electro import ElectroBondGraph, electrical_distances, reaction_charges
+    edges = np.array([[0, 1], [1, 2], [2, 3], [3, 0]])
+    delta = electrical_distances(np.array([0., .25, .5, .75]), 0.0, 1.0)
+    z = reaction_charges(delta, edges, z_ion=1.0)
+    assert abs(z.sum() - 1.0) < 1e-12
+
+    bg = _k_channel()
+    assert bg.check_charge_closure()["closes"]
+
+    broken = ElectroBondGraph(K=bg.K, kappa=bg.kappa, edges=edges,
+                              z=z * 0.5)       # charge no longer closes
+    chk = broken.check_charge_closure()
+    assert not chk["closes"], "non-closing charge went undetected"
+    assert abs(chk["residual"] - 0.5) < 1e-12
+
+
+def test_no_current_without_a_driving_force():
+    """Equal concentrations, zero voltage -> exactly zero current.
+
+    A model that makes current from nothing is broken, and this is the
+    cheapest possible check of that.
+    """
+    bg = _k_channel(1.0, 1.0)
+    assert bg.check_no_current_at_equilibrium()["ok"]
+    assert abs(bg.steady_current(0.0)) < 1e-25
+
+
+def test_single_channel_and_molar_modes_differ_by_avogadro():
+    """The units trap: using the Faraday constant where the elementary charge
+    belongs inflates the current by ~6e23 and still passes every structural
+    check."""
+    from ala2bg.electro import AVOGADRO
+    bg = _k_channel()
+    I_sc = bg.steady_current(0.0)
+    bg.mode = "molar"
+    I_mol = bg.steady_current(0.0)
+    assert abs(I_mol / I_sc - AVOGADRO) / AVOGADRO < 1e-9
+
+
+def test_conductance_is_in_a_physiological_range():
+    """Order-of-magnitude sanity: a K+ channel is tens to hundreds of pS, not
+    1e21 pS (which is what the unit bug produced)."""
+    bg = _k_channel()
+    g = bg.conductance(bg.reversal_potential()) * 1e12
+    assert 1.0 < g < 1000.0, f"conductance {g:.3g} pS is not physiological"
