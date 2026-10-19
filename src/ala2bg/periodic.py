@@ -45,16 +45,39 @@ TWO_PI = 2.0 * np.pi
 
 
 def to_angle(z, period, origin=0.0):
-    """Map a periodic coordinate onto [-pi, pi)."""
+    """Map a periodic coordinate onto [-pi, pi), seam at the window EDGES.
+
+    theta = wrap(2 pi (z - origin)/period - pi), so
+
+        z = origin            -> theta = -pi   (the seam)
+        z = origin + period/2 -> theta = 0     (the middle)
+
+    The -pi offset matters physically. Without it the seam falls in the MIDDLE
+    of the window -- for an ion channel, right through the selectivity filter,
+    which is precisely where the landscape must be continuous.
+    """
     z = np.asarray(z, dtype=np.float64)
-    th = TWO_PI * (z - origin) / period
+    th = TWO_PI * (z - origin) / period - np.pi
     return (th + np.pi) % TWO_PI - np.pi
 
 
 def from_angle(theta, period, origin=0.0):
-    """Inverse of to_angle, returning a value in [origin, origin + period)."""
+    """Inverse of to_angle, returning a value in [origin, origin + period).
+
+    NOTE the modulo: (theta % 2pi), NOT ((theta + pi) % 2pi). The latter
+    introduces a HALF-PERIOD SHIFT, so from_angle(to_angle(z)) came back
+    displaced by period/2. Every value was still in range and the set of
+    values was still correct -- only their ORDER changed -- so a round-trip
+    test that compares sorted arrays passes happily while every coordinate is
+    attached to the wrong position.
+
+    That bug silently attributed the measured drift to positions half a window
+    away, which left the learned landscape uncorrelated with the truth
+    (corr -0.15 at the right magnitude) and no amount of retraining fixed it.
+    test_arbitrary_period_round_trip now compares elementwise.
+    """
     theta = np.asarray(theta, dtype=np.float64)
-    return origin + (theta + np.pi) % TWO_PI / TWO_PI * period
+    return origin + ((theta + np.pi) % TWO_PI) / TWO_PI * period
 
 
 def wrap_period(d, period):

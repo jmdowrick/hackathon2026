@@ -89,6 +89,41 @@ CHARGE_UNIT = {"single_channel": ELEMENTARY_CHARGE, "molar": FARADAY}
 
 
 @dataclass
+class Species:
+    """A chemical species whose potential enters a reaction explicitly.
+
+    u = RT ln(K q). Holding q fixed makes it a chemostat (a reservoir at
+    constant concentration), which is what the extracellular and intracellular
+    baths are for a channel.
+    """
+    name: str
+    K: float                 # mol^-1
+    q: float                 # mol (or any consistent amount unit)
+    clamped: bool = True
+
+    def potential(self, temperature=298.0) -> float:
+        return rt(temperature) * 1000.0 * np.log(max(self.K * self.q, 1e-300))
+
+
+@dataclass
+class Transit:
+    """A reaction that draws one ion from `source` and deposits it in `sink`.
+
+    This is what makes the bath concentrations EXPLICIT rather than baked into
+    a constant affinity. The reaction's driving force becomes
+
+        A_r = u_source - u_sink = RT ln(K_src q_src / (K_sink q_sink))
+
+    so the Nernst potential emerges from the concentrations instead of being
+    pre-computed, the conductance acquires its [K+] dependence, and the model
+    composes into a cell model where the concentrations change.
+    """
+    reaction: int
+    source: str              # supplies the FORWARD direction of that reaction
+    sink: str
+
+
+@dataclass
 class ElectroBondGraph:
     """A bond graph with an electrical port on each electrogenic reaction.
 
@@ -108,8 +143,25 @@ class ElectroBondGraph:
     temperature: float = 298.0
     C_m: float = 1e-14                 # membrane capacitance, F (farads)
     mode: str = "single_channel"       # or "molar" -- see CHARGE_UNIT above
+    species: dict | None = None        # name -> Species
+    transits: list | None = None       # list[Transit]
     labels: list | None = None
     meta: dict = field(default_factory=dict)
+
+    def transit_affinity(self) -> np.ndarray:
+        """Per-reaction affinity contributed by explicit species."""
+        A = np.zeros(self.n_reactions)
+        for t in (self.transits or []):
+            src = self.species[t.source]
+            snk = self.species[t.sink]
+            A[t.reaction] += (src.potential(self.temperature)
+                              - snk.potential(self.temperature))
+        return A
+
+    def set_concentration(self, name, q):
+        """Change a bath amount and let everything downstream follow."""
+        self.species[name].q = float(q)
+        return self
 
     @property
     def q_charge(self) -> float:
@@ -192,6 +244,8 @@ class ElectroBondGraph:
         """
         A = np.zeros_like(self.z) if self.affinity is None \
             else np.asarray(self.affinity, float)
+        if self.transits:
+            A = A + self.transit_affinity()
         arg = (self.z * FARADAY * V + A) / (rt(self.temperature) * 1000.0)
         return np.exp(np.clip(arg, -300, 300))
 

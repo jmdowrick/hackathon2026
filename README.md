@@ -1,4 +1,81 @@
-# ala2bg — trajectories → learned free energy → port-Hamiltonian bond graph
+# ala2bg — from molecular simulation to a runnable physiological model
+
+## What this does, in plain terms
+
+Proteins in your cell membranes work like tiny machines: an ion channel, for
+example, is a gate that lets potassium atoms through at a controlled rate. We
+would like to predict how such a machine behaves — how fast it passes ions, how
+a drug or a mutation changes that — starting from a physical simulation rather
+than from fitting curves to experimental data.
+
+There is a gap in the middle of that ambition. Simulations describe where every
+atom is, millions of times per second. Physiological models describe whole cells
+and organs. **This project builds the bridge: it takes a molecular simulation and
+produces a small, runnable model of the protein's function that a cell-level
+model can use directly.**
+
+Three ideas make it work.
+
+**1. Learn the energy landscape, don't assume it.** As an ion moves through a
+channel it passes over hills and settles in valleys of energy. That landscape
+determines everything about how the channel behaves. We learn it from simulation
+data rather than fitting it to the answer we want.
+
+**2. Build the physics in, rather than checking it afterwards.** Energy cannot be
+created from nothing, and a system at rest cannot spontaneously start doing work.
+Most machine-learning models are free to violate such laws and are penalised when
+they do. Here they are built into the structure of the model, so they hold
+*exactly*, for any settings, at any point in training. The model literally cannot
+produce a current from nothing.
+
+**3. Produce something other people can use.** The output is a standard file
+format (CellML) used by the physiology modelling community, so the result drops
+into larger models of a heart cell or a kidney rather than sitting in a paper.
+
+## What it produces
+
+For a potassium channel, starting from simulation data, the pipeline outputs a
+model that predicts:
+
+- the **reversal potential** — the voltage at which ion flow stops. The pipeline
+  gets −91.3 mV for physiological conditions, which is the textbook value.
+- the **conductance** — how readily ions flow, in the right range for a real
+  potassium channel.
+- the **current–voltage relationship** — the channel's full electrical signature.
+
+None of these are fitted. They emerge from the learned landscape plus the
+physical structure, so they are predictions that can be wrong — and we check
+them against independent values.
+
+## How we try not to fool ourselves
+
+The main risk in this kind of work is building something that reproduces the
+answer because the answer was quietly fed in. Several habits guard against that:
+
+- **Every number says where it came from.** In the channel model, the diffusion
+  rate is measured from our own simulation while the energy landscape comes from
+  published literature. The output records which is which.
+- **Independent cross-checks.** The states of the model are discovered from the
+  simulation data alone, then compared against the experimentally-known
+  structure. On test data they agree to two hundredths of an ångström — but the
+  structure was never used as an input.
+- **Tests that are able to fail.** Each has a control that must give the wrong
+  answer, so a test cannot pass by accident. When a bug is found, a test is added
+  that would have caught it.
+- **Honest limitations, stated up front.** See *Known limitations* below. The
+  simulations underestimate real channel conductance by a known factor; we say
+  so rather than tuning it away.
+
+## Status
+
+A working research prototype. It runs end-to-end in seconds on a laptop, with
+86 automated tests. It has been validated on a small molecule where the exact
+answer is known, and applied to the potassium channel KcsA.
+
+---
+
+# Technical reference
+
 
 Learn a free-energy landscape and a dissipation field from molecular dynamics
 with the second law built into the architecture, discretise into a bond graph
@@ -95,7 +172,7 @@ one charge — **charge closure is structural, not assumed**. That per-step
 coefficient is the family whole-cell models usually assume rather than measure.
 
 ```bash
-make test                                   # 62 fast tests, ~5 s
+make test                                   # 72 fast tests, ~5 s
 python -c "from ala2bg import kcsa; bg = kcsa.permeation_graph(0.02); \
            print(bg.reversal_potential()*1000, 'mV')"     # -91.30 mV = E_K
 ```

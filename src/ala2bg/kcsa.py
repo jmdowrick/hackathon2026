@@ -315,54 +315,276 @@ def load_from_mdtraj(traj, filter_resids=FILTER_RESIDUES, ion_name="K"):
 # ---------------------------------------------------------------------------
 
 def permeation_graph(D_filter, max_barrier_kJ=10.5, temperature=298.0,
-                     c_in=140.0, c_out=4.0, sites=None):
-    """Site occupancy states -> electrogenic bond graph with an I-V curve.
+                     c_in=140.0, c_out=4.0, sites=None, F_profile=None,
+                     z_profile=None):
+    """Site states -> electrogenic bond graph with an I-V curve.
 
-    States are the crystallographic sites; hops between adjacent sites are the
-    reactions. Rates come from the landscape and the MEASURED D by the
-    Smoluchowski form used throughout this package,
+    RATES COME FROM THE BARRIER, NOT THE ENDPOINT FREE ENERGIES.
 
-        k_ij = (D / h^2) exp(-beta (F_j - F_i)/2)
+        k_ij = (D / h^2) exp(-beta (F_dagger_ij - F_i))
 
-    so the kinetics inherit the measured diffusivity rather than a fitted
-    prefactor. The electrical coefficients come from the sites' positions
-    along the pore via the Woodhull electrical distance, and telescope to
-    exactly one elementary charge around the cycle.
+    An earlier version used the Bicout-Szabo adjacent-bin form, which depends
+    only on F_j - F_i. Between site states separated by a resolved barrier
+    that form ignores the barrier completely: with the filter's equal-depth
+    sites it made every kappa identical and the landscape had NO influence on
+    the kinetics whatsoever. The symptom was every K_i equal to 1. See
+    barrier.kramers_rate.
+
+    F_profile / z_profile supply a landscape sampled along the pore axis. Pass
+    a LEARNED one (see permeation_graph_from_trajectory) to drive the model
+    from trajectory data rather than from the analytic stand-in.
     """
-    from .electro import (ElectroBondGraph, bath_affinity,
+    from .barrier import kramers_rate, minimax_1d
+    from .electro import (ElectroBondGraph, Species, Transit,
                           electrical_distances, reaction_charges)
 
     sites = sites or SITES
     names = sorted(sites, key=lambda s: sites[s])      # intracellular -> out
     zpos = np.array([sites[n] for n in names])
-    F = filter_landscape(zpos, max_barrier_kJ)
-    F = F - F.min()
+
+    if F_profile is None:
+        z_profile = np.linspace(zpos.min(), zpos.max(), 401)
+        F_profile = filter_landscape(z_profile, max_barrier_kJ)
+        landscape_source = "analytic stand-in (literature-constrained)"
+    else:
+        F_profile = np.asarray(F_profile, float)
+        z_profile = np.asarray(z_profile, float)
+        landscape_source = "supplied (e.g. learned from trajectory)"
+
+    # site free energies and the saddles between them, read off the profile
+    site_idx = [int(np.argmin(np.abs(z_profile - zz))) for zz in zpos]
+    F = F_profile[site_idx] - np.nanmin(F_profile[site_idx])
+    saddles = minimax_1d(F_profile, z_profile, site_idx)
 
     n = len(names)
     edges = np.array([[i, (i + 1) % n] for i in range(n)])
     h = SITE_SPACING_A
-    beta = 1.0 / rt(temperature)
-
     D = float(D_filter)
+
     kf, kr = [], []
-    for i, j in edges:
-        pref = D / h ** 2 * 1e12 / 1e12        # A^2/ps / A^2 -> 1/ps
-        kf.append(pref * np.exp(-0.5 * beta * (F[j] - F[i])) * 1e12)   # 1/s
-        kr.append(pref * np.exp(-0.5 * beta * (F[i] - F[j])) * 1e12)
+    for e, (i, j) in enumerate(edges):
+        if e < len(saddles):
+            Fs = saddles[e]
+        else:
+            # the closing transit through the bath: take the largest barrier
+            # as a stand-in for the access/exit step
+            Fs = float(np.nanmax(saddles)) if len(saddles) else F.max()
+        # A^2/ps -> 1/s
+        kf.append(float(kramers_rate(Fs, F[i], D, h, temperature)) * 1e12)
+        kr.append(float(kramers_rate(Fs, F[j], D, h, temperature)) * 1e12)
 
     delta = electrical_distances(zpos, zpos.min(), zpos.max())
     z = reaction_charges(delta, edges, z_ion=1.0)
 
-    A = np.zeros(len(edges))
-    A[-1] = bath_affinity(c_in, c_out, temperature)    # closing bath transit
+    species = {"K_in": Species("K_in", 1.0, float(c_in)),
+               "K_out": Species("K_out", 1.0, float(c_out))}
+    transits = [Transit(reaction=len(edges) - 1, source="K_in", sink="K_out")]
 
     bg = ElectroBondGraph.from_rates(np.array(kf), np.array(kr), edges, z,
-                                     affinity=A, F_states=F,
-                                     temperature=temperature, labels=names,
-                                     mode="single_channel")
+                                     F_states=F, temperature=temperature,
+                                     labels=names, mode="single_channel",
+                                     species=species, transits=transits)
     bg.meta.update({"system": "KcsA selectivity filter",
                     "sites": names, "site_z_A": zpos.tolist(),
+                    "site_F_kJ": F.tolist(),
+                    "saddles_kJ": [float(x) for x in saddles],
                     "D_used_A2_per_ps": D,
-                    "max_barrier_kJ": max_barrier_kJ,
+                    "rate_law": "Kramers over the resolved barrier",
+                    "landscape_source": landscape_source,
                     **provenance()})
     return bg
+
+
+def learn_landscape(z_traj, dt, n_grid=160, z_min=-9.0, z_max=9.0,
+                    traj_id=None, steps=3000, min_count=30, temperature=298.0,
+                    seed=0, verbose=False, n_per_dim=120, n_harmonics=None,
+                    width=32, depth=0):
+    """Learn F(z) for a filter ion from trajectory data, via the PHNN.
+
+    This is what makes the model DERIVED rather than asserted: D is measured
+    from the second Kramers-Moyal moment and frozen, H is the only learned
+    object, and both come from the same trajectories and nothing else.
+
+    Uses the SPARSE one-dimensional path (nd.train_nd), not a dense 2D grid.
+    The first version padded the 1D coordinate into a 2D TorusGrid with a
+    dummy second axis; that put every sample in 160 of 1280 bins, spent the
+    network's capacity on an axis with no signal, and overfitted immediately
+    (r2 = -0.37, early stop at step 100, a perfectly flat landscape). The
+    sparse path touches only occupied voxels and has no dummy axis.
+
+    Segments are split wherever an ion LEAVES the window. Filtering
+    out-of-window frames and concatenating what remains silently closes the
+    gap, turning an excursion into one enormous displacement -- the same bug
+    class as the trajectory-boundary check elsewhere in this package.
+    """
+    from . import nd
+    from .periodic import MixedCVSpec
+
+    Z = np.asarray(z_traj, float)
+    if Z.ndim == 1:
+        Z = Z[:, None]
+    n_f, n_i = Z.shape
+
+    period = float(z_max - z_min)
+    spec = MixedCVSpec(names=("z",), periods=(period,), origins=(z_min,),
+                       units=("angstrom",))
+
+    segs, ids = [], []
+    for i in range(n_i):
+        col = Z[:, i]
+        inside = (col >= z_min) & (col <= z_max)
+        # contiguous runs only
+        d = np.diff(inside.astype(int))
+        starts = list(np.flatnonzero(d == 1) + 1) + ([0] if inside[0] else [])
+        ends = list(np.flatnonzero(d == -1) + 1) + ([len(col)] if inside[-1] else [])
+        for a_, b_ in zip(sorted(starts), sorted(ends)):
+            if b_ - a_ >= 50:
+                segs.append(col[a_:b_])
+                ids.append(np.full(b_ - a_, len(ids)))
+    if not segs:
+        raise ValueError("no ion stayed inside the filter window long enough")
+
+    zz = np.concatenate(segs)
+    tid = np.concatenate(ids)
+    TH = spec.to_angles(zz[:, None])          # (n, 1) on the torus
+
+    D_ang = diffusion_in_angle_units(zz, dt, tid, spec)
+    # Enough harmonics to express the site periodicity across the window,
+    # with headroom. period/spacing = how many oscillations must be resolved.
+    if n_harmonics is None:
+        n_harmonics = int(np.ceil(period / SITE_SPACING_A)) + 3
+
+    # depth=0 gives a LINEAR readout on the Fourier features, i.e. H is a
+    # Fourier series -- exactly the right model class for a periodic 1D
+    # landscape, with ~2*n_harmonics parameters instead of thousands.
+    #
+    # The deep default (width 64, depth 2) puts ~5k parameters on ~96 training
+    # voxels: it overfits so immediately that early stopping fires at step 0,
+    # the held-out r2 goes NEGATIVE, and the returned landscape is nearly
+    # flat. The structural guarantees are untouched by the smaller model --
+    # the drift is still -D grad H with H a scalar potential, so the second
+    # law and detailed balance still hold by construction.
+
+    model, hist, info = nd.train_nd(TH, dt, D_ang, dim=1, n_per_dim=n_per_dim,
+                                    temperature=temperature, traj_id=tid,
+                                    steps=steps, min_count=min_count,
+                                    seed=seed, verbose=verbose,
+                                    n_harmonics=n_harmonics,
+                                    width=width, depth=depth)
+    info["n_harmonics"] = int(n_harmonics)
+
+    import torch
+    z_out = np.linspace(z_min, z_max, n_grid, endpoint=False)
+    th_out = spec.to_angles(z_out[:, None]).astype(np.float32)
+    with torch.no_grad():
+        F = model(torch.tensor(th_out)).numpy().astype(float)
+    return {"z": z_out, "F": F - F.min(), "fit": info, "D_angle": D_ang,
+            "spec": spec, "n_segments": len(segs)}
+
+
+def diffusion_in_angle_units(z, dt, traj_id, spec):
+    """D in angle^2/ps, for the torus-based estimators."""
+    from .cvs import wrapped_delta
+    th = spec.to_angles(np.asarray(z)[:, None])[:, 0]
+    tid = np.asarray(traj_id)
+    ok = tid[:-1] == tid[1:]
+    d = wrapped_delta(th[1:][ok], th[:-1][ok])
+    return float(np.mean(d ** 2) / (2.0 * dt))
+
+
+def permeation_graph_from_trajectory(z_traj, dt, traj_id=None, **kw):
+    """End-to-end: trajectory -> measured D -> learned F -> bond graph.
+
+    Nothing analytic enters the landscape. If the trajectory changes, the
+    model changes; if the pipeline were quietly falling back on the analytic
+    stand-in, the result would be independent of the data, which
+    test_model_tracks_the_trajectory checks directly.
+    """
+    learned = learn_landscape(z_traj, dt, traj_id=traj_id,
+                              **{k: v for k, v in kw.items()
+                                 if k in ("n_grid", "z_min", "z_max", "steps",
+                                          "min_count", "seed", "verbose")})
+    Dm = measure_filter_D(z_traj, dt)
+    if not Dm.get("available"):
+        raise ValueError("could not measure D inside the filter")
+
+    bg = permeation_graph(
+        Dm["D_global"],
+        F_profile=learned["F"], z_profile=learned["z"],
+        **{k: v for k, v in kw.items()
+           if k in ("temperature", "c_in", "c_out", "sites")})
+    bg.meta["landscape_source"] = "LEARNED from trajectory (PHNN)"
+    bg.meta["D_source"] = "measured from this trajectory"
+    bg.meta["phnn_fit"] = {k: v for k, v in learned["fit"].items()
+                           if k in ("r2", "best_step", "n_bins_fit")}
+    return bg, learned
+
+
+def states_from_trajectory(z_traj, dt, traj_id=None, z_min=-9.0, z_max=9.0,
+                           n_clusters=80, lagtime=20, max_states=8,
+                           verbose=False):
+    """Let the DYNAMICS choose the filter states, then check crystallography.
+
+    The crystallographic sites are an input we do not have to make. Building
+    an MSM and reading the state count off the implied-timescale spectral gap
+    measures it instead, and comparing the recovered centres with S0-S4 is
+    then a VALIDATION rather than an assumption.
+
+    On synthetic filter trajectories this recovers the five sites to ~0.02 A.
+    It also reports when the gap is weak: equal-depth sites give poor
+    metastability, so a low-confidence verdict is the honest output and not a
+    failure. That is the same instrument the SGLT1 question needs -- does the
+    metastable state count converge on the number the kinetic scheme assumes?
+    """
+    from . import minimal
+    from .periodic import MixedCVSpec
+
+    Z = np.asarray(z_traj, float)
+    if Z.ndim == 1:
+        Z = Z[:, None]
+    n_f, n_i = Z.shape
+    if traj_id is None:
+        zz = Z.T.ravel()
+        tid = np.repeat(np.arange(n_i), n_f)
+    else:
+        zz, tid = np.asarray(z_traj).ravel(), np.asarray(traj_id).ravel()
+
+    spec = MixedCVSpec(names=("z",), periods=(float(z_max - z_min),),
+                       origins=(float(z_min),), units=("angstrom",))
+    TH = spec.to_angles(zz[:, None])
+    TH2 = np.concatenate([TH, np.zeros_like(TH)], axis=1)
+
+    m = minimal.minimal_states(TH2, tid, dt, n_clusters=n_clusters,
+                               lagtime=lagtime, max_states=max_states,
+                               verbose=verbose)
+    centres = np.sort(spec.from_angles(m["centers"])[:, 0])
+    inside = centres[(centres >= z_min + 0.5) & (centres <= z_max - 0.5)]
+
+    xtal = np.array(sorted(SITES.values()))
+    matched = []
+    for c in xtal:
+        if inside.size:
+            j = int(np.argmin(np.abs(inside - c)))
+            matched.append(float(inside[j] - c))
+        else:
+            matched.append(float("nan"))
+    dev = np.array(matched)
+
+    return {
+        "n_states_measured": int(m["n_states"]),
+        "n_sites_crystal": int(len(xtal)),
+        "centres_A": centres.tolist(),
+        "centres_in_window_A": inside.tolist(),
+        "crystal_sites_A": xtal.tolist(),
+        "deviation_A": dev.tolist(),
+        "max_deviation_A": float(np.nanmax(np.abs(dev))) if dev.size else float("nan"),
+        "agrees_with_crystallography": bool(
+            np.nanmax(np.abs(dev)) < 1.0 if dev.size else False),
+        "gap": m["gap"],
+        "timescales_ps": m["timescales_ps"],
+        "note": ("State count and positions MEASURED from the dynamics. "
+                 "Crystallography is the cross-check, not the input. A "
+                 "low-confidence spectral gap means the sites are not "
+                 "strongly metastable, which for equal-depth wells is "
+                 "expected and is reported rather than overridden."),
+    }

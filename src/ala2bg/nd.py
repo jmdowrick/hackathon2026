@@ -106,7 +106,8 @@ def measure_D_nd(X, dt, traj_id=None, lag=1):
 def train_nd(X, dt, D_const, dim=None, n_per_dim=20, temperature=298.0,
              traj_id=None, lag=1, min_count=20, steps=3000, lr=1e-2,
              seed=0, scale=10.0, weight_decay=1e-4, patience=600,
-             val_frac=0.2, verbose=False, device=None):
+             val_frac=0.2, verbose=False, device=None, n_harmonics=2,
+             width=64, depth=2):
     """Fit H in arbitrary dimension against the sparse binned drift.
 
     Same estimator as the 2D path, same early stopping, no dense grid.
@@ -137,7 +138,13 @@ def train_nd(X, dt, D_const, dim=None, n_per_dim=20, temperature=298.0,
     x_tr, y_tr, w_tr = T(pts[ti]), T(tgt[ti]), T(w[ti])
     x_va, y_va, w_va = T(pts[vi]), T(tgt[vi]), T(w[vi])
 
-    model = FreeEnergyNet(dim=dim, scale=scale).to(device)
+    # n_harmonics MUST cover the oscillation of the target. The embedding is
+    # sin/cos up to n_harmonics, so a landscape with p periods across the
+    # window is INEXPRESSIBLE below n_harmonics = p. The KcsA filter has ~5.5
+    # site periods across an 18 A window; at the default 2 the network cannot
+    # represent it at all and returns a nearly flat H however long it trains.
+    model = FreeEnergyNet(dim=dim, n_harmonics=n_harmonics, scale=scale,
+                          width=width, depth=depth).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     beta = 1.0 / rt(temperature)
 

@@ -885,11 +885,30 @@ def test_barrier_features_preserve_the_symmetry_guarantee():
 # ---------------------------------------------------------------------------
 
 def test_arbitrary_period_round_trip():
+    """ELEMENTWISE, not sorted.
+
+    The original version compared sorted arrays, which cannot see a cyclic
+    shift: from_angle had a half-period offset, every value was still in
+    range and the multiset was identical, and the test passed while every
+    coordinate pointed at the wrong place.
+    """
     from ala2bg.periodic import to_angle, from_angle
-    L = 8.4                                   # nm, a plausible box length
-    z = np.linspace(0, L, 50, endpoint=False)
-    back = from_angle(to_angle(z, L), L)
-    assert np.allclose(np.sort(back), np.sort(z), atol=1e-9)
+    for L, o in [(8.4, 0.0), (18.0, -9.0), (3.3, 1.25)]:
+        z = np.linspace(o, o + L, 50, endpoint=False)
+        back = from_angle(to_angle(z, L, o), L, o)
+        assert np.allclose(back, z, atol=1e-9), (
+            f"round trip shifted by {np.median(back - z):.4f} "
+            f"(half period would be {L/2:.4f})")
+
+
+def test_angle_mapping_preserves_order_and_landmarks():
+    """Specific landmarks, so a shift cannot hide."""
+    from ala2bg.periodic import to_angle, from_angle
+    L, o = 18.0, -9.0
+    assert abs(to_angle(o, L, o) + np.pi) < 1e-12        # window start -> -pi
+    assert abs(to_angle(o + L / 2, L, o)) < 1e-12        # middle -> 0
+    assert abs(from_angle(0.0, L, o) - (o + L / 2)) < 1e-12
+    assert abs(from_angle(-np.pi, L, o) - o) < 1e-12
 
 
 def test_wrap_period_handles_box_crossing():
@@ -1179,17 +1198,20 @@ def test_cellml_validates_with_libcellml():
         assert '<units name="mole"' not in text
         assert '<units name="second"' not in text
         # 3. kappa carries the units of v, since (K q) is dimensionless
+        # units follow the mode; see test_cellml_units_follow_the_mode
         vals = _emitted_values(p)
-        assert vals["kappa_0"][1] == "mol_per_s"
-        assert vals["K_S4"][1] == "per_mole"
+        assert vals["kappa_0"][1] == "per_second"
+        assert vals["K_S4"][1] == "dimensionless"
 
 
 def test_cellml_numbers_match_the_python_model():
-    """The check validation cannot do: recompute the flux from the EMITTED
-    values, in the EMITTED units, and compare with the model.
+    """The check validation cannot do: recompute the current from the EMITTED
+    values, in the EMITTED units, and compare with the model across voltages.
 
-    This is what catches an affinity written in J/mol but declared kJ/mol --
-    dimensionally consistent, validates cleanly, wrong by a factor of 1000.
+    Catches two bugs that both validate cleanly:
+      * an affinity written in J/mol but declared kJ/mol (1000x)
+      * the molar charge constant emitted for a single-channel model
+        (Avogadro's number -- the symptom was a current of ~1e13 A)
     """
     from ala2bg import kcsa
     from ala2bg.thermo.cellml_writer import write_cellml
@@ -1201,24 +1223,101 @@ def test_cellml_numbers_match_the_python_model():
         write_cellml(bg, p, max_states=12)
         vals = _emitted_values(p)
 
-    RT = vals["RT"][0]                 # kJ/mol
-    Far = vals["Far"][0]               # kJ/(mol V)
+    RT = vals["RT"][0]
+    Far = vals["Far"][0]
+    q_e = vals["q_e"][0]
     lab = bg.labels
-    q = np.array([vals[f"q_{l}"][0] for l in lab])
     K = np.array([vals[f"K_{l}"][0] for l in lab])
+    mu_in = RT * np.log(vals["K_K_in"][0] * vals["q_K_in"][0])
+    mu_out = RT * np.log(vals["K_K_out"][0] * vals["q_K_out"][0])
+    last = bg.n_reactions - 1
 
-    for V in (0.0, -0.05, 0.05):
-        v_emitted = []
+    for V in (-0.12, -0.05, 0.0, 0.05):
+        q = bg.steady_state(V)
+        tot = 0.0
         for r, (a, b) in enumerate(bg.edges):
             z = vals[f"z_{r}"][0]
-            A = vals.get(f"A_{r}", (0.0, None))[0]       # kJ/mol
-            drive = (z * Far * V + A) / RT
-            v_emitted.append(vals[f"kappa_{r}"][0]
-                             * (K[a] * q[a] * np.exp(drive) - K[b] * q[b]))
-        v_model = bg.fluxes(q, V)
-        assert np.allclose(v_emitted, v_model, rtol=1e-9, atol=1e-30), (
-            f"emitted CellML fluxes disagree with the model at V={V}: "
-            f"{np.array(v_emitted)} vs {v_model}")
+            drive = z * Far * V + (mu_in - mu_out if r == last else 0.0)
+            tot += z * vals[f"kappa_{r}"][0] * (
+                K[a] * q[a] * np.exp(drive / RT) - K[b] * q[b])
+        assert np.isclose(q_e * tot, bg.current(q, V), rtol=1e-8, atol=1e-25), (
+            f"emitted CellML current disagrees at V={V}: "
+            f"{q_e*tot:.4e} vs {bg.current(q, V):.4e}")
+
+
+def test_cellml_units_follow_the_mode():
+    """A single-channel model must not carry the molar charge constant.
+
+    Emitting Faraday where the elementary charge belongs overstates the
+    current by ~6e23 and still validates, because the declared units are
+    internally consistent.
+    """
+    from ala2bg import kcsa
+    from ala2bg.thermo.cellml_writer import write_cellml
+    import tempfile, os
+
+    bg = kcsa.permeation_graph(0.02)
+    assert bg.mode == "single_channel"
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "sc.cellml")
+        write_cellml(bg, p, max_states=12)
+        v = _emitted_values(p)
+        assert v["q_e"][1] == "coulomb"
+        assert abs(v["q_e"][0] - 1.602176634e-19) < 1e-28
+        assert v["kappa_0"][1] == "per_second"
+        assert v["q_S4"][1] == "dimensionless"
+
+        bg.mode = "molar"
+        p2 = os.path.join(d, "mol.cellml")
+        write_cellml(bg, p2, max_states=12)
+        v2 = _emitted_values(p2)
+        assert v2["q_e"][1] == "C_per_mol"
+        assert abs(v2["q_e"][0] - 96485.33212) < 1e-3
+        assert v2["kappa_0"][1] == "mol_per_s"
+        assert v2["q_S4"][1] == "mole"
+
+
+def test_predicted_current_is_physiological():
+    """A K+ channel passes picoamps, not 1e13 A."""
+    from ala2bg import kcsa
+    bg = kcsa.permeation_graph(0.02)
+    for V in (-0.12, -0.05, 0.0, 0.05, 0.1):
+        I = abs(bg.steady_current(V))
+        assert I < 1e-9, f"current {I:.3e} A at {V*1000:.0f} mV is not physiological"
+    assert abs(bg.steady_current(bg.reversal_potential())) < 1e-15
+
+
+def test_potassium_is_an_explicit_variable_not_a_baked_constant():
+    """[K+] must be changeable, and must move the reversal potential.
+
+    Previously the concentrations were folded into a constant affinity at
+    build time, so the emitted model had no K+ in it at all and nothing in
+    OpenCOR could vary it.
+    """
+    from ala2bg import kcsa
+    from ala2bg.thermo.cellml_writer import write_cellml
+    import tempfile, os
+
+    bg = kcsa.permeation_graph(0.02, c_in=140.0, c_out=4.0)
+    assert set(bg.species) == {"K_in", "K_out"}
+    v0 = bg.reversal_potential()
+    bg.set_concentration("K_out", 140.0)
+    v1 = bg.reversal_potential()
+    assert abs(v0 * 1000 + 91.3) < 0.2
+    assert abs(v1) < 1e-3, "symmetric K+ should give ~0 mV reversal"
+
+    # conductance must depend on the permeant ion concentration
+    bg.set_concentration("K_out", 1.0); g_lo = bg.conductance(bg.reversal_potential())
+    bg.set_concentration("K_out", 140.0); g_hi = bg.conductance(bg.reversal_potential())
+    assert g_hi > 2 * g_lo, "conductance did not depend on [K+]"
+
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "m.cellml")
+        bg.set_concentration("K_out", 4.0)
+        write_cellml(bg, p, max_states=12)
+        t = open(p).read()
+    for frag in ("q_K_in", "q_K_out", "mu_K_in", "mu_K_out"):
+        assert frag in t, f"{frag} missing -- K+ not explicit in the CellML"
 
 
 def test_cellml_carries_the_electrical_port():
@@ -1231,7 +1330,7 @@ def test_cellml_carries_the_electrical_port():
         write_cellml(bg, p, max_states=12)
         t = open(p).read()
     for frag in ('name="V" units="volt"', 'name="I" units="ampere"',
-                 'name="z_0"', "F_C"):
+                 'name="z_0"', 'name="q_e"'):
         assert frag in t, f"missing {frag} -- electrical port not emitted"
 
 
@@ -1249,3 +1348,119 @@ def test_writer_refuses_to_emit_invalid_cellml():
                 cw.write_cellml(bg, os.path.join(d, "bad.cellml"), max_states=12)
     finally:
         cw._UNIT_DEFS.clear(); cw._UNIT_DEFS.update(orig)
+
+
+# ---------------------------------------------------------------------------
+# KcsA: is the model DERIVED from the trajectory, or quietly asserted?
+# ---------------------------------------------------------------------------
+
+def _filter_traj(barrier=7.0, dS2=-1.6, dS1=2.2, D=0.015, n=120_000, seed=0):
+    from ala2bg.thermo.smoluchowski import rt
+    beta = 1.0 / rt(298.0)
+
+    def F(z):
+        f = 0.5 * barrier * (1 - np.cos(2 * np.pi * (z + 6.6) / 3.3))
+        f = f + dS2 * np.exp(-0.5 * ((z - 0.0) / 1.0) ** 2)
+        f = f + dS1 * np.exp(-0.5 * ((z - 3.3) / 1.0) ** 2)
+        return f - f.min()
+
+    def g(z):
+        return (F(z + 1e-4) - F(z - 1e-4)) / 2e-4
+
+    rng = np.random.default_rng(seed)
+    Z = np.empty((n, 3)); Z[0] = [-6.6, 0.0, 6.6]
+    s = np.sqrt(2 * D * 1.0)
+    for t in range(1, n):
+        Z[t] = np.clip(Z[t - 1] - D * beta * g(Z[t - 1]) + s * rng.standard_normal(3),
+                       -9, 9)
+    return Z, F, D
+
+
+def test_rates_depend_on_the_barrier_not_just_the_endpoints():
+    """The bug this catches made every kappa identical.
+
+    With equal-depth sites the endpoint-difference (Bicout-Szabo) form gives
+    the same rate for every hop regardless of the barrier between them, so the
+    landscape had no influence on the kinetics at all.
+    """
+    from ala2bg import kcsa
+    lo = kcsa.permeation_graph(0.02, max_barrier_kJ=6.0)
+    hi = kcsa.permeation_graph(0.02, max_barrier_kJ=14.0)
+    assert hi.kappa.max() < 0.25 * lo.kappa.max(), (
+        "raising the barrier did not slow the rates; the landscape is being "
+        "ignored")
+    from ala2bg.thermo.smoluchowski import rt
+    expected = np.exp(-(14.0 - 6.0) / rt(298.0))
+    assert abs(hi.kappa[0] / lo.kappa[0] / expected - 1) < 0.05
+
+
+def test_phnn_is_small_for_a_one_dimensional_landscape():
+    """19 parameters, not 5441.
+
+    The deep default put ~5k parameters on ~96 training voxels, overfitted at
+    step 0, and returned a flat landscape.
+    """
+    from ala2bg.phnn import FreeEnergyNet
+    small = FreeEnergyNet(dim=1, n_harmonics=9, width=32, depth=0)
+    n = sum(p.numel() for p in small.parameters())
+    assert n < 50, f"{n} parameters is too many for a 1D Fourier landscape"
+
+
+@pytest.mark.slow
+def test_learned_landscape_tracks_the_trajectory():
+    """THE non-circularity test.
+
+    Two different landscapes, two trajectories, one pipeline. The recovered
+    barrier must follow the trajectory it was given. If the pipeline were
+    quietly falling back on the analytic stand-in, both would return the same
+    answer.
+    """
+    from ala2bg import kcsa
+
+    out = {}
+    for bar in (6.0, 12.0):
+        Z, F, D = _filter_traj(barrier=bar, n=150_000)
+        learned = kcsa.learn_landscape(Z, 1.0, steps=3000)
+        zc = np.linspace(-6.6, 6.6, 120)
+        t = F(zc); t -= t.mean()
+        l = np.interp(zc, learned["z"], learned["F"]); l -= l.mean()
+        out[bar] = {"corr": float(np.corrcoef(l, t)[0, 1]),
+                    "span": float(l.max() - l.min())}
+
+    for bar, r in out.items():
+        assert r["corr"] > 0.85, f"barrier {bar}: corr only {r['corr']:.3f}"
+
+    # the recovered landscape must RESPOND to the input, not be constant
+    assert out[12.0]["span"] > 1.4 * out[6.0]["span"], (
+        f"recovered span barely moved with the true barrier: {out}; "
+        "a hardcoded fallback would look exactly like this")
+
+
+@pytest.mark.slow
+def test_msm_recovers_the_crystallographic_sites():
+    """The discretisation is MEASURED, with crystallography as the check.
+
+    Not an assumption: deeptime is given only the trajectory and recovers the
+    five filter sites. This is the KcsA form of 'does the metastable state
+    count converge on the number the kinetic scheme assumes?'.
+    """
+    from ala2bg import kcsa
+    Z, F, D = _filter_traj(n=150_000)
+    r = kcsa.states_from_trajectory(Z, 1.0)
+    assert r["max_deviation_A"] < 0.5, (
+        f"recovered centres deviate by {r['max_deviation_A']:.2f} A "
+        f"from the crystallographic sites: {r['centres_in_window_A']}")
+    assert r["agrees_with_crystallography"]
+    # the confidence verdict must be reported, not assumed
+    assert "confident" in r["gap"]
+
+
+@pytest.mark.slow
+def test_measured_D_feeds_through_to_the_conductance():
+    """D is the one number taken from the user's MD, so it must matter."""
+    from ala2bg import kcsa
+    g_lo = kcsa.permeation_graph(0.005)
+    g_hi = kcsa.permeation_graph(0.020)
+    c_lo = g_lo.conductance(g_lo.reversal_potential())
+    c_hi = g_hi.conductance(g_hi.reversal_potential())
+    assert c_hi > 3 * c_lo, "conductance did not scale with the measured D"

@@ -220,3 +220,43 @@ def barrier_features(F, grid, centres, D, temperature=298.0):
                 "log_D": float(np.log10(D)),
             })
     return rows
+
+
+def minimax_1d(F, z, site_idx):
+    """Saddle between consecutive sites on a 1D profile.
+
+    In one dimension the minimax barrier is simply the maximum of F between
+    the two minima -- there is only one path. Returned as an array aligned
+    with consecutive site pairs.
+    """
+    F = np.asarray(F, float)
+    z = np.asarray(z, float)
+    order = np.argsort(z)
+    F, z = F[order], z[order]
+    idx = sorted(int(i) for i in site_idx)
+    out = []
+    for a, b in zip(idx[:-1], idx[1:]):
+        seg = F[a:b + 1]
+        out.append(float(np.nanmax(seg)) if seg.size else np.nan)
+    return np.array(out)
+
+
+def kramers_rate(F_saddle, F_start, D, h, temperature=298.0):
+    """Site-to-site hopping rate over a resolved barrier.
+
+        k = (D / h^2) exp(-beta (F_saddle - F_start))
+
+    USE THIS, NOT the Bicout-Szabo adjacent-bin form, whenever the states are
+    separated by a barrier that the state spacing does not resolve.
+
+    Bicout-Szabo, k_ij = (D/h^2) exp(-beta (F_j - F_i)/2), is correct for
+    ADJACENT GRID BINS, where the barrier is represented by the intervening
+    bins. Applied directly between well-separated site states it uses only the
+    endpoint free energies and so IGNORES THE BARRIER ENTIRELY -- which in the
+    KcsA filter made every kappa identical and left the landscape with no
+    influence on the kinetics at all. It also contradicts ln kappa ~ ln D -
+    beta F_dagger, which is the relation the whole barrier analysis rests on.
+    """
+    beta = 1.0 / rt(temperature)
+    return (D / h ** 2) * np.exp(-beta * (np.asarray(F_saddle)
+                                          - np.asarray(F_start)))
