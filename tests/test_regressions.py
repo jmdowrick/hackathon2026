@@ -560,3 +560,85 @@ def test_diffusion_is_unchanged_by_a_state_dependent_bias():
     d0 = diffusion.measure_D(X0, DT, t0, lag=1)["D_const"]
     d1 = diffusion.measure_D(X1, DT, t1, lag=1)["D_const"]
     assert abs(d1 - d0) / d0 < 0.05, f"D shifted under bias: {d0:.5f} -> {d1:.5f}"
+
+
+# ---------------------------------------------------------------------------
+# MINIMAL DISCRETISATION: the dynamics chooses the states, not a grid.
+# The state count must be a MEASUREMENT with a confidence, not a choice --
+# and the diagnostic must be able to say "no clean k-state description".
+# ---------------------------------------------------------------------------
+
+def test_spectral_gap_finds_a_known_hierarchy():
+    from ala2bg.minimal import spectral_gap
+    # one dominant slow process, then a cluster of fast ones
+    g = spectral_gap([1000.0, 50.0, 45.0, 40.0, 38.0])
+    assert g["recommended"] == 2
+    assert g["confident"] is True
+    assert g["gap_ratio"] > 10
+
+
+def test_spectral_gap_reports_absence_of_a_gap():
+    """Must be able to FAIL to find structure, or it measures nothing.
+
+    This is the Stage-0 stop signal: if a six-state kinetic scheme is asserted
+    and the timescales show no gap at k=6, the mapping is not supported.
+    """
+    from ala2bg.minimal import spectral_gap
+    g = spectral_gap([100.0, 90.0, 82.0, 75.0, 70.0])   # smooth, no gap
+    assert g["confident"] is False
+    assert "NO CLEAR GAP" in g["note"]
+
+
+def test_spectral_gap_is_not_fooled_by_a_uniform_cascade():
+    from ala2bg.minimal import spectral_gap
+    g = spectral_gap([2 ** -i * 1000 for i in range(6)])  # constant ratio 2
+    assert g["confident"] is False, \
+        "a constant-ratio cascade has no distinguished k; must not claim one"
+
+
+def test_coarse_rate_matrix_satisfies_detailed_balance():
+    """Symmetrised counts -> detailed balance -> symmetric kappa, with no grid.
+
+    This is the property that lets the bond graph be built from MSM states
+    instead of n^d bins.
+    """
+    from ala2bg.minimal import coarse_rate_matrix
+    from ala2bg.surrogate import bondgraph_from_rates
+    rng = np.random.default_rng(0)
+    n, k = 20_000, 4
+    labels = rng.integers(0, k, n)
+    tid = np.zeros(n, dtype=int)
+    K, pi, C = coarse_rate_matrix(labels, tid, 1, 1.0, k)
+
+    assert np.allclose(C, C.T), "count matrix not symmetrised"
+    assert abs(pi.sum() - 1) < 1e-12
+    assert np.abs(K.sum(axis=1)).max() < 1e-10, "rows must sum to zero"
+    # detailed balance: pi_i k_ij == pi_j k_ji
+    F = pi[:, None] * K
+    off = ~np.eye(k, dtype=bool)
+    assert np.abs(F - F.T)[off].max() < 1e-12
+
+    bg = bondgraph_from_rates(K, pi)        # raises if kappa is asymmetric
+    assert bg.n_states == k
+
+
+@pytest.mark.slow
+def test_minimal_states_compress_the_grid_route():
+    """End-to-end on the toy: far fewer states, slow process preserved."""
+    from ala2bg import minimal, surrogate
+    d = simulate_toy(n_steps=60_000, n_traj=8, dt=0.5, D=0.01, barrier=12.0, seed=1)
+    X, dt, tid = d["X"], d["dt"], d["traj_id"]
+
+    m = minimal.minimal_states(X, tid, dt, n_clusters=60, lagtime=5, verbose=False)
+    assert 2 <= m["n_states"] <= 6, f"implausible state count {m['n_states']}"
+    assert m["n_states"] < 40 * 40, "no compression achieved"
+
+    K, pi, _ = minimal.coarse_rate_matrix(m["labels"], tid, 5, dt, m["n_states"])
+    bg = surrogate.bondgraph_from_rates(K, pi)
+    from ala2bg.thermo import bondgraph as bgm
+    ck = bgm.check_thermo(bg)
+    assert ck["Hdot_nonpos"], "second law violated by the coarse bond graph"
+    assert ck["equilibrium_flux_rel"] < 1e-9
+
+    ts = surrogate.timescales_from_rates(K)
+    assert ts.size and ts[0] > 0
