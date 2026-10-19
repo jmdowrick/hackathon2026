@@ -642,3 +642,80 @@ def test_minimal_states_compress_the_grid_route():
 
     ts = surrogate.timescales_from_rates(K)
     assert ts.size and ts[0] > 0
+
+
+# ---------------------------------------------------------------------------
+# PHGNN: the architectural guarantee, and the honest bound on what it can do.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.slow
+def test_phgnn_kappa_is_symmetric_by_construction():
+    """kappa_ij == kappa_ji for ANY weights -- detailed balance is structural.
+
+    Checked on an UNTRAINED network and after a weight perturbation, so it
+    cannot be passing because training happened to make it symmetric.
+    """
+    import torch
+    from ala2bg import phgnn
+
+    ds = phgnn.make_dataset(n_graphs=12, n_grid=30, seed=5)
+    assert ds, "dataset generation produced no graphs"
+    rec = ds[0]
+    nf = phgnn.node_features(rec).shape[1]
+    ef = phgnn.edge_geometry(rec).shape[1]
+
+    for seed in (0, 1, 2):
+        torch.manual_seed(seed)
+        model = phgnn.PHGNN(nf, ef)
+        with torch.no_grad():                    # perturb every weight
+            for p in model.parameters():
+                p.add_(torch.randn_like(p) * 0.5)
+        # RELATIVE error: a perturbed net can output log kappa ~1e5, where
+        # float32 round-off alone is O(0.1) and an absolute bound would
+        # falsely fail.
+        assert phgnn.check_symmetry(model, rec) < 1e-5, \
+            "kappa not symmetric under edge reversal"
+
+
+@pytest.mark.slow
+def test_kappa_is_governed_by_the_saddle_not_the_endpoints():
+    """The bound on any cheap-feature rate surrogate.
+
+    ln kappa ~ ln D - beta * F_saddle, so endpoint free energies predict kappa
+    only insofar as the saddle correlates with them -- a property of the
+    system, not of the model. Pinned so nobody later claims a kappa surrogate
+    works in general because it worked on a correlated benchmark.
+    """
+    from ala2bg import phgnn
+    from ala2bg.grid import TorusGrid
+    from ala2bg.thermo.smoluchowski import rt
+
+    rng = np.random.default_rng(3)
+    grid = TorusGrid(30, 30)
+    beta = 1.0 / rt(298.0)
+
+    lk, fsum = [], []
+    for _ in range(40):
+        F = phgnn.random_landscape(grid, rng, n_modes=int(rng.integers(2, 4)),
+                                   amp=float(rng.uniform(6, 18)))
+        D = float(10 ** rng.uniform(-2.3, -1.7))
+        rec = phgnn.exact_graph(grid, F, D, max_states=5)
+        if not rec:
+            continue
+        for e, k in zip(rec["edges"], rec["kappa"]):
+            lk.append(np.log(k))
+            fsum.append(rec["F"][e[0]] + rec["F"][e[1]])
+    lk, fsum = np.array(lk), np.array(fsum)
+    assert len(lk) > 30, "too few edges to conclude"
+
+    A = np.stack([fsum, np.ones_like(fsum)], axis=1)
+    c, *_ = np.linalg.lstsq(A, lk, rcond=None)
+    r2 = 1 - np.var(lk - A @ c) / np.var(lk)
+
+    # endpoint features leave real variance unexplained: kappa is not a
+    # function of them, and the residual is the saddle
+    assert r2 < 0.95, (
+        f"endpoint free energies explained R2={r2:.3f} of ln kappa; if this "
+        "ever reaches ~1 the benchmark has become degenerate and the "
+        "'cheap features predict kappa' conclusion would be an artefact"
+    )
