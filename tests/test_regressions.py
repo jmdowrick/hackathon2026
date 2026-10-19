@@ -500,3 +500,63 @@ def test_reactive_paths_bias_the_drift_estimator():
         f"reactive-path bias not detected: {err_reactive:.4f} vs "
         f"{err_unbiased:.4f}; if this ever passes trivially the test is void"
     )
+
+
+# ---------------------------------------------------------------------------
+# PROPERTY: a STATE-dependent bias (REST/metadynamics/umbrella) is recoverable
+# by an analytic local correction, unlike FUTURE-conditioned path selection.
+# This is the scalability route. See scripts/biased_drift_recovery.py.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.slow
+def test_state_dependent_bias_is_analytically_recoverable():
+    """Three arms on the same estimator: unbiased control, biased-uncorrected,
+    biased-corrected. The uncorrected arm MUST fail, or the correction is
+    being credited for nothing.
+    """
+    from scripts.biased_drift_recovery import (BARRIER, D_TRUE, bias_grad,
+                                               fit, simulate)
+    from ala2bg.data import toy_potential
+    from ala2bg.thermo.smoluchowski import rt
+
+    g = TorusGrid(30, 30)
+    pts = g.center_grid()
+    F_true = toy_potential(pts, BARRIER); F_true -= F_true.min()
+    beta = 1.0 / rt(298.0)
+
+    def accuracy(strength, corrected):
+        X, tid = simulate(strength, n_steps=60_000, n_traj=8, seed=3)
+        corr = D_TRUE * beta * bias_grad(pts, strength) if corrected else None
+        H, m = fit(X, tid, g, corr)
+        _, counts, _ = fes.histogram_fes(X, g, min_count=1)
+        sel = m & (counts >= 25)
+        h = H[sel] - H[sel].mean(); f = F_true[sel] - F_true[sel].mean()
+        return float(np.sqrt(np.mean((h - f) ** 2))), int(
+            counts[np.abs(pts[:, 0]) < 0.4].sum())
+
+    rmse_ref, cov_ref = accuracy(0.0, False)
+    rmse_unc, cov_bias = accuracy(10.0, False)
+    rmse_cor, _ = accuracy(10.0, True)
+
+    # the bias must actually improve barrier coverage, else nothing is tested
+    assert cov_bias > 5 * cov_ref, \
+        f"bias did not improve coverage ({cov_bias} vs {cov_ref})"
+    # control arm works
+    assert rmse_ref < 2.0, f"unbiased control failed: {rmse_ref:.2f}"
+    # uncorrected MUST be wrong -- otherwise the correction proves nothing
+    assert rmse_unc > 2.0 * rmse_ref, \
+        f"uncorrected bias was already accurate ({rmse_unc:.2f}); test vacuous"
+    # and the analytic correction must recover it
+    assert rmse_cor < 0.5 * rmse_unc, \
+        f"force correction failed to recover the landscape: {rmse_cor:.2f}"
+
+
+def test_diffusion_is_unchanged_by_a_state_dependent_bias():
+    """D is set by the thermostat, not the potential -- the reason a biased
+    run can donate its D as well as its drift."""
+    from scripts.biased_drift_recovery import simulate, DT
+    X0, t0 = simulate(0.0, n_steps=40_000, n_traj=6, seed=5)
+    X1, t1 = simulate(10.0, n_steps=40_000, n_traj=6, seed=5)
+    d0 = diffusion.measure_D(X0, DT, t0, lag=1)["D_const"]
+    d1 = diffusion.measure_D(X1, DT, t1, lag=1)["D_const"]
+    assert abs(d1 - d0) / d0 < 0.05, f"D shifted under bias: {d0:.5f} -> {d1:.5f}"
