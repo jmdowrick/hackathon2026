@@ -438,3 +438,65 @@ def test_memory_diagnostic_recovers_a_known_effective_diffusivity():
         band = sorted([curve[lo], curve[hi]])
         assert band[0] * 0.5 <= mem["D_eff_to_reconcile"] <= band[1] * 2.0, \
             "matched lag does not bracket D_eff on the measured curve"
+
+
+# ---------------------------------------------------------------------------
+# PROPERTY: conditioning on a future event biases the drift estimator.
+# This is why raw transition-path (TPS/TIS/RETIS) data cannot be fed to
+# binned_drift without weights that restore the equilibrium path measure.
+# See scripts/reactive_path_bias.py for the full measurement.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.slow
+def test_reactive_paths_bias_the_drift_estimator():
+    """Reactive-only frames must give a measurably WORSE drift estimate.
+
+    Non-vacuous by construction: the same estimator on the same trajectories,
+    differing only in which frames are kept. The unbiased arm is the control
+    and must succeed, so a failure of the reactive arm cannot be blamed on the
+    estimator itself.
+    """
+    from ala2bg.thermo.smoluchowski import rt
+    from scripts.reactive_path_bias import reactive_segments  # noqa
+
+    barrier, D_true, dt = 12.0, 0.01, 0.5
+    d = simulate_toy(n_steps=150_000, n_traj=6, dt=dt, D=D_true,
+                     barrier=barrier, seed=7)
+    X, tid = d["X"], d["traj_id"]
+    # 20x20, not 40x40: reactive frames are ~0.5% of the data, so the barrier
+    # region needs bins large enough to be populated by them.
+    g = TorusGrid(20, 20)
+    pts = g.center_grid()
+
+    beta = 1.0 / rt(298.0)
+    from ala2bg.data import toy_grad
+    b_eq = -D_true * beta * toy_grad(pts, barrier)
+
+    in_A = np.abs(X[:, 0] + np.pi / 2) < 0.25
+    in_B = np.abs(X[:, 0] - np.pi / 2) < 0.25
+    react = np.zeros(len(X), dtype=bool)
+    for t in np.unique(tid):
+        s = tid == t
+        react[s] = reactive_segments(X[s, 0], in_A[s], in_B[s])
+
+    assert react.sum() > 500, "too few reactive frames to conclude anything"
+
+    bd_all = phnn.binned_drift(X, dt, g, tid, min_count=20)
+    bd_rx = phnn.binned_drift(X[react], dt, g, tid[react], min_count=20)
+    zone = bd_all["mask"] & bd_rx["mask"] & (np.abs(pts[:, 0]) < 0.6)
+    assert zone.sum() >= 10, "barrier region too sparsely covered"
+
+    def rms(v):
+        return float(np.sqrt(np.mean(np.sum(v ** 2, axis=1))))
+
+    err_unbiased = rms((bd_all["drift"] - b_eq)[zone])
+    err_reactive = rms((bd_rx["drift"] - b_eq)[zone])
+
+    # control: the estimator itself works on unbiased data
+    # observed: unbiased ~0.012, reactive ~0.068 (ratio ~5.7)
+    assert err_unbiased < 0.03, f"control arm failed: {err_unbiased:.4f}"
+    # the actual claim
+    assert err_reactive > 2.0 * err_unbiased, (
+        f"reactive-path bias not detected: {err_reactive:.4f} vs "
+        f"{err_unbiased:.4f}; if this ever passes trivially the test is void"
+    )
