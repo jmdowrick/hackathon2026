@@ -878,3 +878,74 @@ def test_barrier_features_preserve_the_symmetry_guarantee():
         _, b = model(x, ei.flip(1), ea)
     scale = float(torch.maximum(a.abs(), b.abs()).max().clamp(min=1.0))
     assert float((a - b).abs().max()) / scale < 1e-5
+
+
+# ---------------------------------------------------------------------------
+# PERIODIC COORDINATES WITH ARBITRARY PERIOD (ion z in a periodic box).
+# ---------------------------------------------------------------------------
+
+def test_arbitrary_period_round_trip():
+    from ala2bg.periodic import to_angle, from_angle
+    L = 8.4                                   # nm, a plausible box length
+    z = np.linspace(0, L, 50, endpoint=False)
+    back = from_angle(to_angle(z, L), L)
+    assert np.allclose(np.sort(back), np.sort(z), atol=1e-9)
+
+
+def test_wrap_period_handles_box_crossing():
+    """The permeation analogue of the +-pi bug: an ion leaving the top of the
+    box and re-entering the bottom moved a little, not a whole box length."""
+    from ala2bg.periodic import wrap_period
+    L = 8.0
+    d = wrap_period(np.array([-7.9]), L)       # naive reading: moved -7.9 nm
+    assert abs(d[0] - 0.1) < 1e-9, f"got {d[0]}, expected +0.1"
+
+
+def test_mixed_cvspec_rejects_bad_periods():
+    from ala2bg.periodic import MixedCVSpec
+    with pytest.raises(ValueError):
+        MixedCVSpec(names=("a", "b"), periods=(1.0, 0.0))
+    with pytest.raises(ValueError):
+        MixedCVSpec(names=("a", "b"), periods=(1.0,))
+
+
+def test_diffusivity_converts_back_to_physical_units():
+    """D measured in angle^2/time must convert back by (dz/dtheta)^2.
+
+    Getting this wrong rescales every rate, so it is checked numerically
+    rather than trusted.
+    """
+    from ala2bg.periodic import MixedCVSpec
+    L = 8.0
+    spec = MixedCVSpec(names=("z",), periods=(L,), origins=(0.0,), units=("nm",))
+    D_phys_true = 0.05                                    # nm^2/ps
+    scale = 2 * np.pi / L                                 # rad per nm
+    D_angle = D_phys_true * scale ** 2
+    assert np.allclose(spec.D_angle_to_physical(D_angle), D_phys_true)
+
+
+def test_mixed_cvspec_hash_is_sensitive_to_the_period():
+    """Two runs with different box lengths must not share a CV hash."""
+    from ala2bg.periodic import MixedCVSpec
+    a = MixedCVSpec(names=("z",), periods=(8.0,), origins=(0.0,), units=("nm",))
+    b = MixedCVSpec(names=("z",), periods=(8.4,), origins=(0.0,), units=("nm",))
+    assert a.hash() != b.hash()
+    assert a.hash() == MixedCVSpec(names=("z",), periods=(8.0,),
+                                   origins=(0.0,), units=("nm",)).hash()
+
+
+def test_angles_feed_the_existing_torus_machinery_unchanged():
+    """The point of the rescaling: existing estimators work without edits."""
+    from ala2bg.periodic import MixedCVSpec
+    from ala2bg.cvs import wrapped_delta, fourier_features
+    L = 6.0
+    spec = MixedCVSpec(names=("z1", "z2"), periods=(L, L),
+                       origins=(0.0, 0.0), units=("nm", "nm"))
+    rng = np.random.default_rng(0)
+    Z = rng.uniform(0, L, size=(200, 2))
+    TH = spec.to_angles(Z)
+    assert TH.shape == Z.shape
+    assert TH.min() >= -np.pi - 1e-12 and TH.max() < np.pi + 1e-12
+    assert fourier_features(TH).shape == (200, spec.n_features)
+    d = wrapped_delta(TH[1:], TH[:-1])
+    assert np.abs(d).max() <= np.pi + 1e-12
