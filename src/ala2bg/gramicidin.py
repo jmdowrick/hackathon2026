@@ -326,3 +326,57 @@ def unexplained_missing_torsions(top, system, ff,
                         bad.append("-".join(f"{atoms[x].residue.name}:"
                                             f"{atoms[x].name}" for x in q))
     return bad
+
+
+# ---------------------------------------------------------------------------
+# Reading a production run (scripts/hpc/run_ga.py output)
+# ---------------------------------------------------------------------------
+
+RUN_KEYS = ("ion_rel", "axis", "origin", "box", "wat_rel", "step",
+            "ion_names", "dt_fs", "save_every_steps", "prod_step0",
+            "channel", "complete")
+
+
+def load_run(path, ion="K", drop_ns=0.0):
+    """A run_ga.py trajectory -> per-frame (z, r) of each ion, pore frame.
+
+    Raises, rather than guessing, if any array is missing: an old or partial
+    file analysed without its radial distances is how the KcsA analysis once
+    lost its radial gate.
+
+    z, r are projected with EACH FRAME'S OWN axis, which the runner measured
+    from the GA backbone at that frame; ion_rel is already the minimum-image
+    displacement from that frame's origin. Ions keep their atom order, so
+    the arrays serve atom-tracked D and the permutation-invariant features
+    alike. drop_ns discards the start of production as further equilibration.
+    """
+    import json as _json
+    d = np.load(path, allow_pickle=False)
+    missing = [k for k in RUN_KEYS if k not in d.files]
+    if missing:
+        raise ValueError(f"{path} lacks {missing}; not a run_ga.py output, or "
+                         "written by an older runner")
+    names = d["ion_names"].astype(str)
+    sel = names == ion
+    if not sel.any():
+        raise ValueError(f"no {ion} ions in {path} (have {sorted(set(names))})")
+    dt_ps = float(d["save_every_steps"]) * float(d["dt_fs"]) / 1000.0
+    t_ns = (d["step"] - int(d["prod_step0"])) * float(d["dt_fs"]) / 1e6
+    keep = t_ns >= drop_ns
+    rel = d["ion_rel"][keep][:, sel, :].astype(float)
+    ax = d["axis"][keep]
+    z = np.einsum("fij,fj->fi", rel, ax)
+    r = np.linalg.norm(rel - z[..., None] * ax[:, None, :], axis=-1)
+    w = d["wat_rel"][keep].astype(float)
+    wz = np.einsum("fij,fj->fi", w, ax)
+    steps = d["step"][keep]
+    if len(steps) > 1 and len(np.unique(np.diff(steps))) != 1:
+        raise ValueError("frame steps are not evenly spaced; the trajectory "
+                         "has gaps or duplicates")
+    return {
+        "z": z, "r": r, "t_ns": t_ns[keep], "dt_ps": dt_ps,
+        "water_z": wz, "n_water_in_channel": np.isfinite(wz).sum(axis=1),
+        "box": d["box"][keep], "channel": _json.loads(str(d["channel"])),
+        "complete": bool(d["complete"]),
+        "ion_atoms": d["ion_atoms"][sel] if "ion_atoms" in d.files else None,
+    }

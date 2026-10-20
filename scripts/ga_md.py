@@ -71,7 +71,7 @@ def measure_frame(top, X):
 
 
 def prepare(padding_nm=1.5, ion_conc=0.15, lipid="DMPC", smoke_ps=0.0,
-            platform=None):
+            platform=None, pore_water_half_A=10.5, pore_water_spacing_A=3.0):
     import openmm as mm
     from openmm import app, unit
     from ala2bg import gramicidin as ga
@@ -93,6 +93,47 @@ def prepare(padding_nm=1.5, ion_conc=0.15, lipid="DMPC", smoke_ps=0.0,
                   ionicStrength=ion_conc * unit.molar)
     top, pos = m.topology, m.positions
     print(f"  {top.getNumAtoms()} atoms in {time.time() - t0:.0f} s")
+
+    # PORE WATER. addMembrane packs lipid around the protein and solvates
+    # above and below it, but leaves the lumen EMPTY (measured: 0 waters
+    # within 10 A of the junction). GA conducts through a single-file water
+    # column; a dry pore conducts nothing, and an SRV trained on a run that
+    # starts dry would learn the wetting transition, not permeation. So the
+    # column is placed explicitly, on axis, dipoles PERPENDICULAR to it so
+    # the start favours neither orientation of the water wire.
+    X0 = np.array(pos.value_in_unit(unit.angstrom))
+    o0, a0, _ = measure_frame(top, X0)
+    wz = np.arange(-pore_water_half_A, pore_water_half_A + 1e-9,
+                   pore_water_spacing_A)
+    e1 = np.cross(a0, [1.0, 0.0, 0.0])
+    if np.linalg.norm(e1) < 1e-6:
+        e1 = np.cross(a0, [0.0, 1.0, 0.0])
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(a0, e1)
+    half = np.radians(104.52 / 2)
+    wtop = app.Topology()
+    wch = wtop.addChain()
+    wpos = []
+    for z in wz:
+        O = o0 + z * a0
+        res = wtop.addResidue("HOH", wch)
+        aO = wtop.addAtom("O", app.element.oxygen, res)
+        aH1 = wtop.addAtom("H1", app.element.hydrogen, res)
+        aH2 = wtop.addAtom("H2", app.element.hydrogen, res)
+        wtop.addBond(aO, aH1)
+        wtop.addBond(aO, aH2)
+        wpos += [O, O + 0.9572 * (np.sin(half) * e1 + np.cos(half) * e2),
+                 O + 0.9572 * (-np.sin(half) * e1 + np.cos(half) * e2)]
+    heavy = [a.index for a in top.atoms() if a.element is not None
+             and a.element.symbol != "H" and a.residue.name != "HOH"]
+    wO = np.array(wpos)[0::3]
+    dmin = float(np.min(np.linalg.norm(
+        wO[:, None, :] - X0[heavy][None, :, :], axis=-1)))
+    m.add(wtop, unit.Quantity([tuple(p / 10.0) for p in wpos], unit.nanometer))
+    top, pos = m.topology, m.positions
+    check(results, "pore water column placed without clashes", dmin > 2.2,
+          f"{len(wz)} waters at {pore_water_spacing_A} A spacing; closest "
+          f"heavy atom {dmin:.2f} A")
 
     X = np.array(pos.value_in_unit(unit.angstrom))
     box = np.array([top.getPeriodicBoxVectors()[i][i].value_in_unit(
@@ -222,6 +263,7 @@ def prepare(padding_nm=1.5, ion_conc=0.15, lipid="DMPC", smoke_ps=0.0,
                        "coordinates; use these, not load_gramicidin()'s, "
                        "for trajectory analysis"),
         "cap_charges": "by analogy (ACE / NME + Ser), not RESP",
+        "pore_water_placed": int(len(wz)),
         "hydrogen_mass_amu": 4, "timestep_fs": 4,
         "checks": results,
     }
@@ -233,6 +275,119 @@ def prepare(padding_nm=1.5, ion_conc=0.15, lipid="DMPC", smoke_ps=0.0,
     return n_fail
 
 
+BUNDLE_FILES = {"system.xml": OUT, "minimised.pdb": OUT, "system.json": OUT,
+                "run_ga.py": "scripts/hpc", "launch_ga.sh": "scripts/hpc",
+                "README_ga.txt": "scripts/hpc"}
+
+
+def bundle():
+    """Everything the workstation needs, in one directory and one tarball."""
+    import shutil
+    import tarfile
+    bdir = os.path.join(OUT, "bundle")
+    os.makedirs(bdir, exist_ok=True)
+    for name, src in BUNDLE_FILES.items():
+        if not os.path.exists(os.path.join(src, name)):
+            raise SystemExit(f"missing {src}/{name}; run --prepare first")
+        shutil.copy2(os.path.join(src, name), os.path.join(bdir, name))
+    tar = os.path.join(OUT, "ga_bundle.tar.gz")
+    with tarfile.open(tar, "w:gz") as tf:
+        tf.add(bdir, arcname="ga_bundle")
+    print(f"wrote {bdir}/ and {tar}")
+    return bdir
+
+
+def preflight(platform="OpenCL", equil_scale=0.01):
+    """Run the SHIPPED bundle end to end, in isolation, and check the result.
+
+    In a fresh directory, with a stub `ala2bg` that raises on import placed
+    first on the path, so any dependency on this package fails loudly:
+      1. compressed equilibration + 4 ps production
+      2. re-run with a longer --ns: must resume, frames contiguous
+      3. restore an older state under newer results (a crash between the two
+         writes): the newer frames must be dropped, not duplicated
+      4. a second run while the lock is held is refused; a stale lock is not
+      5. the output loads with gramicidin.load_run and yields features
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    results = []
+    bdir = bundle()
+    tmp = tempfile.mkdtemp(prefix="ga_preflight_")
+    for name in BUNDLE_FILES:
+        shutil.copy2(os.path.join(bdir, name), tmp)
+    with open(os.path.join(tmp, "ala2bg.py"), "w") as f:
+        f.write('raise ImportError("run_ga.py must not need ala2bg")\n')
+
+    def run(*args):
+        r = subprocess.run([sys.executable, "run_ga.py", "--dir", ".",
+                            "--platform", platform, "--checkpoint-ps", "1",
+                            *args], cwd=tmp, capture_output=True, text=True,
+                           timeout=1800)
+        return r.returncode, r.stdout + r.stderr
+
+    rc, out = run("--equil-scale", str(equil_scale), "--ns", "0.004")
+    check(results, "standalone equilibration + production", rc == 0,
+          out.strip().splitlines()[-1] if out.strip() else "")
+    if rc != 0:
+        print(out[-2000:])
+        return results, tmp
+    eq = json.load(open(os.path.join(tmp, "equil.json")))
+    check(results, "equilibration checks recorded", "checks" in eq,
+          ", ".join(k for k, v in eq["checks"].items() if not v) or "all ok")
+
+    d0 = np.load(os.path.join(tmp, "ga_traj.npz"))
+    n0 = len(d0["step"])
+    rc, out = run("--ns", "0.008")
+    d1 = np.load(os.path.join(tmp, "ga_traj.npz"))
+    steps = d1["step"]
+    check(results, "resume extends without gaps or duplicates",
+          rc == 0 and "resuming" in out and len(steps) == 2 * n0
+          and len(set(np.diff(steps).tolist())) == 1
+          and np.array_equal(d0["ion_rel"], d1["ion_rel"][:n0]),
+          f"{n0} -> {len(steps)} frames")
+
+    st = os.path.join(tmp, "production_state.xml")
+    shutil.copy2(st, st + ".old")
+    run("--ns", "0.012")
+    shutil.copy2(st + ".old", st)
+    rc, out = run("--ns", "0.012")
+    d2 = np.load(os.path.join(tmp, "ga_traj.npz"))
+    s2 = d2["step"]
+    check(results, "crash between writes: newer frames dropped, not doubled",
+          rc == 0 and "dropped" in out and len(s2) == 3 * n0
+          and len(set(np.diff(s2).tolist())) == 1,
+          f"{len(s2)} frames, steps {s2[0]}..{s2[-1]}")
+
+    lock = os.path.join(tmp, "run.lock")
+    with open(lock, "w") as f:
+        f.write(str(os.getpid()))           # a live process: this one
+    rc, out = run("--ns", "0.016")
+    check(results, "second run refused while the lock is held",
+          rc != 0 and "another run" in out, "")
+    with open(lock, "w") as f:
+        f.write("999999")                   # a dead pid
+    rc, out = run("--ns", "0.016")
+    check(results, "stale lock taken over", rc == 0 and "stale" in out, "")
+
+    from ala2bg import gramicidin as ga
+    from ala2bg.features import Channel, invariant_features
+    r = ga.load_run(os.path.join(tmp, "ga_traj.npz"))
+    c = r["channel"]
+    X, names = invariant_features(r["z"], r["r"],
+                                  Channel(c["z_lo"], c["z_hi"], c["r_max"]))
+    check(results, "output loads and yields features",
+          X.shape[0] == len(r["t_ns"]) and np.isfinite(X).all(),
+          f"{X.shape[0]} frames x {X.shape[1]} features; water in channel "
+          f"{int(np.median(r['n_water_in_channel']))} (median)")
+    n_fail = sum(not x["ok"] for x in results)
+    print(f"\npreflight: {len(results) - n_fail}/{len(results)} passed "
+          f"(scratch dir {tmp})")
+    return results, tmp
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prepare", action="store_true")
@@ -241,10 +396,21 @@ def main():
     ap.add_argument("--lipid", default="DMPC")
     ap.add_argument("--smoke", type=float, default=0.0, help="ps")
     ap.add_argument("--platform", default=None)
+    ap.add_argument("--bundle", action="store_true")
+    ap.add_argument("--preflight", action="store_true",
+                    help="run the shipped bundle end to end, in isolation")
     a = ap.parse_args()
     if a.prepare:
-        return 1 if prepare(a.padding, a.conc, a.lipid, a.smoke,
-                            a.platform) else 0
+        if prepare(a.padding, a.conc, a.lipid, a.smoke, a.platform):
+            return 1
+    if a.bundle:
+        bundle()
+    if a.preflight:
+        res, _ = preflight(a.platform or "OpenCL")
+        return 1 if any(not x["ok"] for x in res) else 0
+    if not (a.prepare or a.bundle or a.preflight):
+        ap.print_help()
+    return 0
     ap.print_help()
     return 0
 

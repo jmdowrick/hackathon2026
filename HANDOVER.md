@@ -217,9 +217,34 @@ that matter most (junction, mouths). OpenMM silently drops unmatched
 torsions; `unexplained_missing_torsions` separates those from ff14SB's
 deliberate k=0 terms. ~0.6 s/ps locally.
 
-Next: staged equilibration (NPT, MonteCarloMembraneBarostat, GA restraints
-released in steps) and an HPC runner like run_kcsa.py; then unbiased runs
--> SRV (deeptime) -> WESTPA (not installed).
+Equilibration + production runner built: `scripts/hpc/run_ga.py`
+(openmm + numpy only). Six restrained stages (~1 ns: NVT then NPT with
+MonteCarloMembraneBarostat, periodic restraints on GA heavy atoms and lipid
+P z, released in steps), eight equilibration checks that BLOCK production on
+failure, then unbiased NPT production. The pore is pre-filled with an
+8-water single-file column: addMembrane leaves it dry.
+
+**The remote machine is a workstation, not a cluster -- no SLURM.** The
+runner is built for that: resumes from XML state on re-run (results written
+before state, frames newer than the state dropped), a lock file prevents two
+runs in one directory, no silent CPU fallback, `--max-hours` checked every
+frame. `launch_ga.sh` detaches with nohup/setsid and fails fast in the
+terminal if the platform is missing. The KcsA runner never reached the HPC
+machine (too many bugs) -- do not treat it as a working template.
+
+`python scripts/ga_md.py --preflight` runs the SHIPPED bundle end to end in
+isolation (a stub ala2bg that raises on import): 7/7 pass on OpenCL here,
+including resume, crash-between-writes, and both lock cases.
+`gramicidin.load_run()` reads the output and refuses gappy or old-format
+files.
+
+Full ~1 ns equilibration verified locally (OpenCL, 16 min): all 8 checks
+pass. Final: area per lipid 59.3 A^2 (DMPC expt 60.6), P-P 35.1 A, tilt
+0.5 deg, backbone RMSD 0.52 A, 11 waters in the channel, junction 0.76 A off
+the bilayer centre. Production ~100 ns/day on this Mac's OpenCL.
+
+Next: production on the workstation -> SRV (deeptime) -> WESTPA (not
+installed).
 
 ---
 
@@ -227,11 +252,20 @@ released in steps) and an HPC runner like run_kcsa.py; then unbiased runs
 
 ```bash
 source .venv/bin/activate
-make test                 # 109 fast tests, ~5 s. Run after every change.
+make test                 # 115 fast tests, ~5 s. Run after every change.
 python -m pytest tests/ -q        # includes slow training tests, ~3 min
 python scripts/mutation_audit.py  # are the tests able to fail?
 make toy                  # exact ground truth, ~20 s
 make ala2                 # real alanine dipeptide, ~45 s
+```
+
+Gramicidin A MD (built, pre-flighted locally, not yet run at length):
+
+```bash
+python scripts/ga_md.py --prepare            # 1JNO -> GA in DMPC, 11 checks
+python scripts/ga_md.py --preflight          # ship-path test, 7 checks
+# runs/ga_md/ga_bundle.tar.gz -> workstation; see README_ga.txt inside:
+#   PYTHON=python PLATFORM=CUDA ./launch_ga.sh --ns 100 --device 0
 ```
 
 KcsA MD (built, pre-flighted, never run in production):

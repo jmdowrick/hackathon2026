@@ -173,6 +173,24 @@ MUTATIONS = [
      "    X = (X - g[\"origin\"])",
      "the MD frame is the analysis frame (bug 3's class)",
      "test_ga_topology_is_complete_and_in_the_pore_frame"),
+
+    ("runner origin off the helix axis", "../../scripts/hpc/run_ga.py",
+     "    origin = c + np.dot(junction - c, axis) * axis",
+     "    origin = junction",
+     "the runner records in the same frame the package analyses in",
+     "test_runner_frame_matches_the_package_frame"),
+
+    ("runner lock ignores a live holder", "../../scripts/hpc/run_ga.py",
+     "                os.kill(pid, 0)",
+     "                raise ProcessLookupError",
+     "two runs cannot write one checkpoint",
+     "test_lock_refuses_a_live_holder_and_takes_a_stale_one"),
+
+    ("resume keeps frames newer than the state", "../../scripts/hpc/run_ga.py",
+     '        keep = old["step"] <= cur',
+     '        keep = old["step"] >= 0',
+     "a crash between writes cannot duplicate frames (SLOW tier only)",
+     "test_preflight_runs_the_shipped_bundle_end_to_end"),
 ]
 
 
