@@ -271,7 +271,16 @@ def analyse():
     d = np.load(f"{OUT}/filter_ions.npz", allow_pickle=True)
     Z, dt = d["Z"], float(d["dt_ps"])
     R = d["R"] if "R" in d.files else None
-    print(f"{Z.shape[0]} frames x {Z.shape[1]} ions, dt = {dt} ps")
+    ns = float(d["ns_completed"]) if "ns_completed" in d.files else Z.shape[0]*dt/1000
+    req = float(d["ns_requested"]) if "ns_requested" in d.files else None
+    early = bool(d["stopped_early"]) if "stopped_early" in d.files else False
+    part = bool(d["partial"]) if "partial" in d.files else False
+    print(f"{Z.shape[0]} frames x {Z.shape[1]} ions, dt = {dt} ps, {ns:.2f} ns")
+    if part:
+        print("  WARNING: file is a mid-run checkpoint; the job did not finish")
+    elif early and req:
+        print(f"  note: stopped early at {ns:.1f} of {req:.0f} ns requested "
+              "(wall clock), data complete")
 
     # RADIAL GATE. Without it a bulk ion 30 A off-axis at the same height
     # counts as being in the filter and D comes out ~29x too high -- above

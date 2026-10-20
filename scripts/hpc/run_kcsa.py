@@ -41,6 +41,9 @@ def main():
     ap.add_argument("--equil-ps", type=float, default=200.0)
     ap.add_argument("--platform", default="CUDA")
     ap.add_argument("--out", default="filter_ions.npz")
+    ap.add_argument("--max-hours", type=float, default=None,
+                    help="stop cleanly after this long and flush complete "
+                         "results, instead of being killed at the wall clock")
     ap.add_argument("--checkpoint-ns", type=float, default=10.0,
                     help="write partial results this often, so a job that "
                          "hits its wall-clock limit still returns data")
@@ -97,14 +100,20 @@ def main():
     ckpt = max(1, int(a.checkpoint_ns * 1000 / DT_PS))
 
     Z, R, done, t0 = [], [], 0, time.time()
+    stopped_early = False
     o0, ax0 = np.array(meta["origin"]), np.array(meta["axis"])
 
-    def flush(partial):
+    def flush(partial, stopped_early=False):
+        # ns_requested alongside ns_completed, so a run cut short by
+        # --max-hours is distinguishable from one that finished. Both are
+        # complete and flushed; only the length differs, and the analysis
+        # should be able to say which it got.
         arr = np.array(Z)
         np.savez_compressed(
             os.path.join(d, a.out), Z=arr, R=np.array(R), dt_ps=stride * DT_PS,
             ion_names=meta.get("ion_names", []), partial=partial,
-            ns_completed=done * DT_PS / 1000.0)
+            ns_completed=done * DT_PS / 1000.0, ns_requested=a.ns,
+            stopped_early=stopped_early)
 
     while done < total:
         n = min(stride, total - done)
@@ -132,11 +141,22 @@ def main():
 
         if done % ckpt < stride:
             ns = done * DT_PS / 1000.0
-            rate = ns / max(time.time() - t0, 1e-9) * 86400
+            elapsed = time.time() - t0
+            rate = ns / max(elapsed, 1e-9) * 86400
             print(f"  {ns:7.2f} ns   {rate:7.1f} ns/day", flush=True)
             flush(True)
 
-    flush(False)
+            # Stop CLEANLY rather than being killed at the wall clock. A
+            # killed job loses whatever accumulated since the last
+            # checkpoint and leaves a file flagged partial; stopping on our
+            # own terms flushes everything and exits 0.
+            if a.max_hours is not None and elapsed > a.max_hours * 3600:
+                print(f"  reached --max-hours ({a.max_hours} h) at {ns:.2f} "
+                      "ns; stopping cleanly", flush=True)
+                stopped_early = True
+                break
+
+    flush(False, stopped_early)
     ns = done * DT_PS / 1000.0
     print(f"done: {ns:.2f} ns, {len(Z)} frames at {stride*DT_PS} ps -> {a.out}")
 

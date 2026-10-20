@@ -408,6 +408,36 @@ def permeation_graph(D_filter, max_barrier_kJ=10.5, temperature=298.0,
             f"sites snap up to {max(snap):.2f} A onto the landscape grid; "
             "the frames do not line up")
 
+    # Do the crystallographic sites actually sit at the MINIMA of the supplied
+    # landscape? With the protein restrained, MD ions settle ~1.5 A off the
+    # crystal sites and stay there (measured over 1 ns: drift ~0.00 A). If the
+    # learned minima are offset, reading F at the crystal positions samples
+    # the barriers instead of the wells and every site free energy is wrong in
+    # the same direction. Reported rather than silently corrected: whether the
+    # offset is force-field relaxation or an artifact of restraining the
+    # protein is a question for the user, not for this function.
+    site_offsets = None
+    if F_profile is not None and len(z_profile) > 10:
+        from .barrier import basins_from_landscape
+        try:
+            order = np.argsort(z_profile)
+            zz_s, FF_s = np.asarray(z_profile)[order], np.asarray(F_profile)[order]
+            loc_min = [i for i in range(1, len(zz_s) - 1)
+                       if FF_s[i] <= FF_s[i - 1] and FF_s[i] <= FF_s[i + 1]]
+            if loc_min:
+                mins = zz_s[loc_min]
+                site_offsets = [float(mins[np.argmin(np.abs(mins - z))] - z)
+                                for z in zpos]
+                worst = float(np.max(np.abs(site_offsets)))
+                if worst > 1.0:
+                    print(f"     NOTE: crystallographic sites sit up to "
+                          f"{worst:.2f} A from the learned landscape minima "
+                          f"{np.round(site_offsets, 2).tolist()}; site free "
+                          "energies are being read off the shoulders of the "
+                          "wells, not their bottoms")
+        except Exception:
+            site_offsets = None
+
     site_idx = [int(np.argmin(np.abs(z_profile - zz))) for zz in zpos]
     F = F_profile[site_idx].astype(float)
 
@@ -484,6 +514,7 @@ def permeation_graph(D_filter, max_barrier_kJ=10.5, temperature=298.0,
                     "cavity_included": bool("Scav" in names),
                     "cavity_F_parameterised": bool(cav_declared),
                     "frame": "Thr75 CA plane" if F_profile is not None else "n/a",
+                    "site_offset_from_minima_A": site_offsets,
                     "landscape_source": landscape_source,
                     "phnn_used": phnn_used,
                     "D_is_measured": False,
