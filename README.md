@@ -1,4 +1,7 @@
-# ala2bg — from molecular simulation to a runnable physiological model
+# structure-to-physiology — from molecular simulation to a runnable organ-scale model
+
+*(package name `ala2bg` is historical: the project began on alanine dipeptide
+and now runs on ion channels.)*
 
 ## What this does, in plain terms
 
@@ -66,11 +69,30 @@ answer because the answer was quietly fed in. Several habits guard against that:
   simulations underestimate real channel conductance by a known factor; we say
   so rather than tuning it away.
 
+## What it has been applied to
+
+The method is deliberately system-agnostic: it consumes trajectories plus a
+definition of the coordinates of interest, and nothing in it is specific to one
+molecule. So far:
+
+| system | role | what it established |
+|---|---|---|
+| analytic double well | unit test | exact ground truth; the machinery is correct before any real data |
+| **alanine dipeptide** | validation | a molecule where the answer is independently known. Learned landscape matches truth at correlation 0.98; diffusivity recovered to 0.5% |
+| 4-dimensional model system | scalability | works where a grid-based method cannot: cost grows with data, not with the number of coordinates |
+| **KcsA potassium channel** | application | a real membrane protein, with structure taken from the PDB, electrical behaviour, and a model that reproduces the textbook reversal potential |
+
+The KcsA work added the parts a physiological model needs and a small molecule
+does not: an **electrical port**, so membrane voltage and ionic current are part
+of the model; geometry **measured from the crystal structure** rather than
+assumed; and output that composes into cell-level models.
+
 ## Status
 
 A working research prototype. It runs end-to-end in seconds on a laptop, with
-86 automated tests. It has been validated on a small molecule where the exact
-answer is known, and applied to the potassium channel KcsA.
+88 automated tests, plus a **mutation audit** that deliberately breaks the code
+to confirm the tests can actually fail (12 of 14 breakages caught on the fast
+suite; the audit names any that are not).
 
 ---
 
@@ -419,9 +441,16 @@ fetches the same file directly over HTTP.
 
 Learning free energies from MD is not new. MSMs on alanine dipeptide are a
 textbook exercise. Port-Hamiltonian and GENERIC-style structure-preserving
-networks exist.
+networks exist. Bond-graph models of transporters exist (Hunter et al.).
 
 **The novel join is the last one**: a learned continuous structure-preserving
 model discretised into a bond-graph / CellML component, with thermodynamic
-consistency carried end-to-end as an architectural invariant. Claim that join
-and nothing more.
+consistency carried end-to-end as an architectural invariant, and an electrical
+port that makes the result a physiological component rather than a kinetic
+scheme. Claim that join and nothing more.
+
+**Scope, stated plainly.** The method is general; the evidence is not yet. It is
+validated on small systems where ground truth exists and demonstrated on KcsA
+with structure-derived geometry. The step that remains untested is whether a
+learned landscape resolves the barrier of a large membrane protein, where the
+transition region is both rarer and higher-dimensional.

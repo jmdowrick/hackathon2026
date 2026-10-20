@@ -249,7 +249,7 @@ def train_binned(
                     print(f"  early stop at {step} (best {best['step']})")
                 break
 
-    if False:
+    if best["state"] is not None:
         model.load_state_dict(best["state"])
     history.append({"step": best["step"], "train": float("nan"),
                     "val": best["val"], "best": True})

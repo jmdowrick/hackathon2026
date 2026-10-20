@@ -52,6 +52,11 @@ SITES = {"S0": 6.6, "S1": 3.3, "S2": 0.0, "S3": -3.3, "S4": -6.6}
 FILTER_SEQUENCE = "TVGYG"
 FILTER_RESIDUES = (75, 76, 77, 78, 79)       # Thr75 Val76 Gly77 Tyr78 Gly79
 CAVITY_Z_A = -13.0                            # water-filled cavity, approx
+# Free energy of the cavity ion site relative to the filter sites. The cavity
+# is a water-filled space below the filter that holds a hydrated K+ weakly --
+# a real site, but a shallow one. PARAMETERISED: the sign and rough magnitude
+# are from the structural literature, the exact value is not measured here.
+CAVITY_F_kJ = 4.0
 
 # --- published kinetics ----------------------------------------------------
 PUBLISHED = {
@@ -206,7 +211,7 @@ def project_ions(ion_xyz, origin, axis):
 
 
 def measure_filter_D(z_traj, dt, z_min=-9.0, z_max=9.0, lag=1,
-                     n_bins=12, min_count=50):
+                     n_bins=12, min_count=50, r_traj=None, r_max=6.0):
     """D(z) for K+ inside the filter, from the second Kramers-Moyal moment.
 
     z_traj : (n_frames, n_ions) ion coordinate along the pore axis, angstroms
@@ -234,6 +239,16 @@ def measure_filter_D(z_traj, dt, z_min=-9.0, z_max=9.0, lag=1,
     z0 = Z[:-lag]
     z1 = Z[lag:]
     inside = (z0 >= z_min) & (z0 <= z_max) & (z1 >= z_min) & (z1 <= z_max)
+
+    # RADIAL GATE. z is the projection onto the pore axis, so an axial window
+    # alone admits bulk ions tens of angstroms off-axis at the same height.
+    # On a real solvated system that inflated D from ~0.02 to 1.19 A^2/ps --
+    # above the bulk value -- while every other diagnostic looked fine.
+    if r_traj is not None:
+        Rr = np.asarray(r_traj, float)
+        if Rr.ndim == 1:
+            Rr = Rr[:, None]
+        inside &= (Rr[:-lag] <= r_max) & (Rr[lag:] <= r_max)
     if not inside.any():
         return {"available": False, "note": "no ion-frames inside the filter"}
 
@@ -259,6 +274,8 @@ def measure_filter_D(z_traj, dt, z_min=-9.0, z_max=9.0, lag=1,
         "counts": counts, "n_thin_bins": int(thin.sum()),
         "D_global": glob, "lag": lag, "tau_ps": tau,
         "n_pairs": int(inside.sum()),
+        "r_max_A": (None if r_traj is None else float(r_max)),
+        "radially_gated": bool(r_traj is not None),
         "units": "angstrom^2/ps",
     }
 
@@ -317,7 +334,8 @@ def load_from_mdtraj(traj, filter_resids=FILTER_RESIDUES, ion_name="K"):
 def permeation_graph(D_filter, max_barrier_kJ=10.5, temperature=298.0,
                      c_in=140.0, c_out=4.0, sites=None, F_profile=None,
                      z_profile=None, radius_profile=None,
-                     radius_z=None, field="uniform"):
+                     radius_z=None, field="geometry", include_cavity=False,
+                     cavity_F_kJ=None):
     """Site states -> electrogenic bond graph with an I-V curve.
 
     RATES COME FROM THE BARRIER, NOT THE ENDPOINT FREE ENERGIES.
@@ -339,7 +357,9 @@ def permeation_graph(D_filter, max_barrier_kJ=10.5, temperature=298.0,
     from .electro import (ElectroBondGraph, Species, Transit,
                           electrical_distances, reaction_charges)
 
-    sites = sites or SITES
+    sites = dict(sites or SITES)
+    if include_cavity and "Scav" not in sites:
+        sites["Scav"] = CAVITY_Z_A
     names = sorted(sites, key=lambda s: sites[s])      # intracellular -> out
     zpos = np.array([sites[n] for n in names])
 
@@ -347,15 +367,33 @@ def permeation_graph(D_filter, max_barrier_kJ=10.5, temperature=298.0,
         z_profile = np.linspace(zpos.min(), zpos.max(), 401)
         F_profile = filter_landscape(z_profile, max_barrier_kJ)
         landscape_source = "analytic stand-in (literature-constrained)"
+        phnn_used = False
     else:
         F_profile = np.asarray(F_profile, float)
         z_profile = np.asarray(z_profile, float)
         landscape_source = "supplied (e.g. learned from trajectory)"
+        phnn_used = None          # the caller must say; see from_trajectory
 
     # site free energies and the saddles between them, read off the profile
     site_idx = [int(np.argmin(np.abs(z_profile - zz))) for zz in zpos]
-    F = F_profile[site_idx] - np.nanmin(F_profile[site_idx])
+    F = F_profile[site_idx].astype(float)
+
+    # The filter landscape (a corrugation with the carbonyl spacing) does not
+    # describe the water-filled cavity, so the cavity site takes a DECLARED
+    # free energy rather than an extrapolated one. Recorded as parameterised.
+    cav_declared = False
+    if "Scav" in names:
+        F[names.index("Scav")] = (CAVITY_F_kJ if cavity_F_kJ is None
+                                  else float(cavity_F_kJ))
+        cav_declared = True
+    F = F - np.nanmin(F)
     saddles = minimax_1d(F_profile, z_profile, site_idx)
+    if cav_declared:
+        # barrier out of the cavity into S4: the gate/entry step
+        i = names.index("Scav")
+        if i < len(saddles):
+            saddles[i] = float(np.nanmax(saddles[np.isfinite(saddles)])) \
+                if np.isfinite(saddles).any() else F.max()
 
     n = len(names)
     edges = np.array([[i, (i + 1) % n] for i in range(n)])
@@ -410,7 +448,11 @@ def permeation_graph(D_filter, max_barrier_kJ=10.5, temperature=298.0,
                     "delta": delta.tolist(),
                     "z_per_reaction": z.tolist(),
                     "field_model": field_note,
+                    "cavity_included": bool("Scav" in names),
+                    "cavity_F_parameterised": bool(cav_declared),
                     "landscape_source": landscape_source,
+                    "phnn_used": phnn_used,
+                    "D_is_measured": False,
                     **provenance()})
     return bg
 
@@ -535,6 +577,8 @@ def permeation_graph_from_trajectory(z_traj, dt, traj_id=None, **kw):
            if k in ("temperature", "c_in", "c_out", "sites")})
     bg.meta["landscape_source"] = "LEARNED from trajectory (PHNN)"
     bg.meta["D_source"] = "measured from this trajectory"
+    bg.meta["phnn_used"] = True
+    bg.meta["D_is_measured"] = True
     bg.meta["phnn_fit"] = {k: v for k, v in learned["fit"].items()
                            if k in ("r2", "best_step", "n_bins_fit")}
     return bg, learned
@@ -698,3 +742,88 @@ def kcsa_radius_model(z, filter_r=1.2, cavity_r=5.0, vestibule_r=3.5,
     cav = np.abs(z - cavity_centre) <= cavity_half
     r = np.where(cav, cavity_r, r)
     return r
+
+
+def sites_from_structure(pdb_id="1K4C", cache_dir="data", centre_on="S2",
+                         names=("Scav", "S4", "S3", "S2", "S1", "S0", "Sext")):
+    """Site positions MEASURED from resolved K+ ions in a PDB structure.
+
+    1K4C resolves seven K+ on the pore axis. Their spacings (7.07, 3.34, 3.21,
+    3.40, 4.54, 3.04 A) identify the cavity site, the four filter sites and an
+    external site directly, so the positions stop being an assumption.
+
+    Against the values this module previously assumed, S4/S3/S1 agree within
+    0.15 A and S0 is 1.3 A further out than a uniform 3.3 A spacing implies --
+    the S1-S0 gap is 4.54 A, not 3.3. That correction is only available from
+    the structure.
+    """
+    from . import pdb as pdbmod
+
+    r = pdbmod.load_kcsa(pdb_id, cache_dir)
+    z = np.asarray(r["ion_z_A"], float)
+    if len(z) < 5:
+        raise ValueError(f"{pdb_id}: only {len(z)} on-axis ions resolved")
+
+    use = names[:len(z)]
+    sites = dict(zip(use, z))
+    if centre_on in sites:
+        off = sites[centre_on]
+        sites = {k: float(v - off) for k, v in sites.items()}
+    return sites, r
+
+
+def permeation_graph_from_structure(D_filter, pdb_id="1K4C", cache_dir="data",
+                                    use_sites=("Scav", "S4", "S3", "S2",
+                                               "S1", "S0"),
+                                    F_profile=None, z_profile=None,
+                                    phnn_used=False, D_is_measured=False,
+                                    **kw):
+    """Bond graph with the GEOMETRY measured from a structure.
+
+    Site positions and the pore radius profile (hence the electrical
+    distances) come from the PDB entry. The free-energy landscape still has to
+    come from somewhere else -- pass F_profile/z_profile from
+    learn_landscape() to make it PHNN-derived, and set phnn_used accordingly.
+
+    The flags are explicit and unset by default on purpose: a model is only
+    labelled as derived when something derived it.
+    """
+    sites, r = sites_from_structure(pdb_id, cache_dir)
+    sites = {k: v for k, v in sites.items() if k in use_sites}
+
+    # centre the measured radius profile on the same origin as the sites
+    _, raw = sites_from_structure(pdb_id, cache_dir)
+    off = float(np.asarray(raw["ion_z_A"], float)[3])
+    rz = np.asarray(r["radius_z_A"], float) - off
+    rr = np.asarray(r["radius_A"], float)
+
+    bg = permeation_graph(D_filter, sites=sites, field="geometry",
+                          radius_z=rz, radius_profile=rr,
+                          F_profile=F_profile, z_profile=z_profile, **kw)
+    bg.meta.update({
+        "geometry_source": f"measured from PDB {r['pdb_id']}",
+        "site_source": "resolved K+ ion positions",
+        "radius_source": "minimum heavy-atom clearance per slab, C4 assembly",
+        "pdb_id": r["pdb_id"],
+        "phnn_used": bool(phnn_used),
+        "D_is_measured": bool(D_is_measured),
+    })
+    return bg
+
+
+def provenance_report(bg) -> dict:
+    """Per-parameter provenance, so an artifact cannot overstate itself."""
+    m = bg.meta
+    return {
+        "site_positions": m.get("site_source", "assumed (module defaults)"),
+        "electrical_distances": m.get("field_model", "unknown"),
+        "pore_radius": m.get("radius_source", "parameterised stand-in"),
+        "free_energy_landscape": m.get("landscape_source", "unknown"),
+        "diffusivity": ("measured from trajectory" if m.get("D_is_measured")
+                        else "SUPPLIED AS A LITERAL -- not measured here"),
+        "phnn_used": bool(m.get("phnn_used")),
+        "cavity_free_energy": ("parameterised" if m.get("cavity_F_parameterised")
+                               else "n/a"),
+        "fully_derived": bool(m.get("phnn_used") and m.get("D_is_measured")
+                              and m.get("site_source")),
+    }

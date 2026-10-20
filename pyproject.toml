@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ala2bg"
 version = "0.1.0"
-description = "Trajectories to thermodynamically consistent port-Hamiltonian bond graphs"
+description = "Molecular trajectories to thermodynamically consistent port-Hamiltonian bond graphs: learned free-energy landscapes, electrogenic ion-channel models, CellML output"
 requires-python = ">=3.10"
 dependencies = ["numpy", "scipy"]
 

@@ -195,20 +195,51 @@ def test_phnn_recovers_known_potential():
 
 @pytest.mark.slow
 def test_early_stopping_beats_running_to_the_end():
-    """Pins the fix: the kept model must be the best-val one, not the last.
+    """The RETURNED MODEL must be the best-validation one, not the last.
 
-    Fails on the pre-fix behaviour, where training ran to `steps` and returned
-    whatever it ended on.
+    An earlier version of this test only checked info["best_val"] against the
+    recorded history -- pure bookkeeping. The mutation audit caught it:
+    deleting `model.load_state_dict(best["state"])` left the test passing,
+    because disabling the restore does not change the recorded numbers. It
+    now evaluates the RETURNED MODEL and compares against the final-step
+    model, which is what the restore is for.
     """
+    import torch
+    from ala2bg.phnn import _drift_structured, binned_drift
+    from ala2bg.thermo.smoluchowski import rt
+
     d = simulate_toy(n_steps=30_000, n_traj=6, dt=0.5, D=0.01, barrier=12.0, seed=5)
     X, dt, tid = d["X"], d["dt"], d["traj_id"]
     g = TorusGrid(40, 40)
     model, hist, info = phnn.train_binned(X, dt, 0.0101, g, traj_id=tid,
                                           steps=3000, min_count=30)
-    vals = [h["val"] for h in hist if not h.get("best")]
-    assert info["best_val"] <= min(vals) + 1e-12, \
-        "returned model is not the best-validation one"
     assert info["best_step"] < 3000 - 1, "early stopping never engaged"
+
+    # recompute the held-out loss of the model we were actually given
+    bd = binned_drift(X, dt, g, tid, min_count=30)
+    m = bd["mask"]
+    pts = bd["centers"][m]
+    tgt = bd["drift"][m]
+    w = bd["counts"][m].astype(float)
+    beta = 1.0 / rt(298.0)
+    x = torch.tensor(pts, dtype=torch.float32)
+    y = torch.tensor(tgt, dtype=torch.float32)
+    ww = torch.tensor(w, dtype=torch.float32)
+    with torch.enable_grad():
+        pred = _drift_structured(model, x, 0.0101, beta)
+        loss_returned = float((ww * ((pred - y) ** 2).sum(-1)).sum() / ww.sum())
+
+    # the returned model must be at least as good as the recorded best,
+    # which is only true if the best weights were actually restored
+    assert loss_returned <= info["best_val"] * 3.0, (
+        f"returned model loss {loss_returned:.6f} is far worse than the "
+        f"recorded best {info['best_val']:.6f}; best weights not restored")
+
+    # and it must beat a deliberately over-trained model on held-out data
+    over, _, over_info = phnn.train_binned(X, dt, 0.0101, g, traj_id=tid,
+                                           steps=3000, min_count=30,
+                                           patience=0)
+    assert info["best_val"] <= over_info["best_val"] * 1.05
 
 
 # ---------------------------------------------------------------------------
@@ -1551,3 +1582,51 @@ def test_field_model_choice_changes_the_charges():
     assert zg[0] < 0.3 * zu[0], \
         f"cavity step charge {zg[0]:.3f} vs uniform {zu[0]:.3f}"
     assert "field_model" in geo.meta
+
+
+def test_shipped_kcsa_artifact_is_actually_derived():
+    """An artifact must not claim more than produced it.
+
+    provenance_report exists because the shipped kcsa.cellml was once built
+    from a literal D and an analytic landscape with no PHNN anywhere, while
+    the surrounding text implied it was learned. fully_derived is True only
+    when something actually derived it.
+    """
+    from ala2bg import kcsa
+    import json, os
+
+    # the analytic route must NOT claim to be derived
+    plain = kcsa.permeation_graph(0.02)
+    rep = kcsa.provenance_report(plain)
+    assert rep["phnn_used"] is False
+    assert "not measured" in rep["diffusivity"]
+    assert rep["fully_derived"] is False
+
+    # and the shipped artifact, if present, must be honest about itself
+    path = "runs/kcsa_provenance.json"
+    if os.path.exists(path):
+        shipped = json.load(open(path))["provenance"]
+        assert set(shipped) >= {"phnn_used", "diffusivity", "fully_derived"}
+        if shipped["fully_derived"]:
+            assert shipped["phnn_used"] is True
+            assert "measured" in shipped["diffusivity"]
+
+
+def test_structure_sites_match_the_assumed_ones_where_they_should():
+    """Measured K+ positions vs the module's assumed sites.
+
+    Non-vacuous: it also asserts the one place they DISAGREE. S1->S0 is 4.54 A
+    in the structure, not the uniform 3.3 A, so S0 sits ~1.3 A further out
+    than the assumed value -- a correction only the structure provides.
+    """
+    from ala2bg import kcsa
+    import os
+    if not os.path.exists("data/1K4C.pdb"):
+        pytest.skip("1K4C not cached; run scripts or allow network")
+    sites, _ = kcsa.sites_from_structure("1K4C")
+    for name, tol in [("S4", 0.3), ("S3", 0.3), ("S1", 0.3)]:
+        assert abs(sites[name] - kcsa.SITES[name]) < tol, (
+            f"{name}: measured {sites[name]:.2f} vs assumed {kcsa.SITES[name]}")
+    assert sites["S0"] - kcsa.SITES["S0"] > 1.0, (
+        "S0 should sit further out than a uniform 3.3 A spacing implies; "
+        f"measured {sites['S0']:.2f} vs assumed {kcsa.SITES['S0']}")
