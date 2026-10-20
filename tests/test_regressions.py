@@ -1700,3 +1700,69 @@ def test_sites_snap_tightly_onto_the_landscape_grid():
     with pytest.raises(ValueError, match="resolve|snap|frame"):
         kcsa.permeation_graph_from_structure(
             0.02, F_profile=np.zeros_like(coarse), z_profile=coarse)
+
+
+# ---------------------------------------------------------------------------
+# OVERCLAIMING. A network that merely RAN is not a measured landscape.
+# ---------------------------------------------------------------------------
+
+def test_landscape_learning_is_radially_gated():
+    """Without a radial gate the bulk ions dominate the fit.
+
+    In a solvated system the 0.15 M salt puts ~50 K+ everywhere, and they
+    span every z in the window. Gating on z alone therefore learns the
+    landscape of bulk water: apparent coverage went from 15% to 100% and the
+    minima moved 0.65-2.19 A off the crystallographic sites.
+    """
+    from ala2bg import kcsa
+    rng = np.random.default_rng(0)
+    n = 4000
+    # two confined filter ions, on-axis
+    zf = np.stack([0.5 + 0.15 * rng.standard_normal(n),
+                   4.0 + 0.15 * rng.standard_normal(n)], axis=1)
+    rf = np.abs(0.2 * rng.standard_normal((n, 2)))
+    # twenty bulk ions, spanning the window, far off-axis
+    zb = rng.uniform(-10, 19, size=(n, 20))
+    rb = rng.uniform(10, 30, size=(n, 20))
+    Z = np.concatenate([zf, zb], axis=1)
+    R = np.concatenate([rf, rb], axis=1)
+
+    ungated = kcsa.learn_landscape(Z, 0.4, z_min=-10, z_max=19, steps=50,
+                                   min_count=5)
+    gated = kcsa.learn_landscape(Z, 0.4, z_min=-10, z_max=19, steps=50,
+                                 min_count=5, r_traj=R, r_max=6.0)
+    assert gated["radially_gated"] is True
+    assert ungated["coverage"] > 0.8, "bulk ions should look like full coverage"
+    assert gated["coverage"] < 0.3, (
+        f"gated coverage {gated['coverage']:.2f}; the filter ions occupy two "
+        "narrow wells and cannot cover the window")
+    assert not gated["landscape_is_measured"]
+
+
+def test_poor_coverage_blocks_the_fully_derived_claim():
+    """fully_derived must require a MEASURED landscape, not merely that a
+    network ran. This is the overclaim the provenance exists to prevent."""
+    from ala2bg import kcsa
+    import os
+    if not os.path.exists("data/1K4C.pdb"):
+        pytest.skip("1K4C not cached")
+
+    sites, _ = kcsa.sites_from_structure("1K4C")
+    zs = np.array(sorted(sites.values()))
+    zp = np.linspace(zs.min() - 2.5, zs.max() + 2.5, 400)
+
+    good = kcsa.permeation_graph_from_structure(
+        0.02, F_profile=np.zeros_like(zp), z_profile=zp,
+        phnn_used=True, D_is_measured=True)
+    good.meta["landscape_is_measured"] = True
+    assert kcsa.provenance_report(good)["fully_derived"] is True
+
+    poor = kcsa.permeation_graph_from_structure(
+        0.02, F_profile=np.zeros_like(zp), z_profile=zp,
+        phnn_used=True, D_is_measured=True)
+    poor.meta["landscape_is_measured"] = False
+    poor.meta["landscape_coverage"] = 0.15
+    rep = kcsa.provenance_report(poor)
+    assert rep["fully_derived"] is False, (
+        "a landscape fitted to 15% of the window was accepted as derived")
+    assert rep["landscape_coverage"] == 0.15

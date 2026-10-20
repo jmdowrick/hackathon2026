@@ -525,7 +525,7 @@ def permeation_graph(D_filter, max_barrier_kJ=10.5, temperature=298.0,
 def learn_landscape(z_traj, dt, n_grid=160, z_min=-9.0, z_max=9.0,
                     traj_id=None, steps=3000, min_count=30, temperature=298.0,
                     seed=0, verbose=False, n_per_dim=120, n_harmonics=None,
-                    width=32, depth=0):
+                    width=32, depth=0, r_traj=None, r_max=6.0):
     """Learn F(z) for a filter ion from trajectory data, via the PHNN.
 
     This is what makes the model DERIVED rather than asserted: D is measured
@@ -556,10 +556,22 @@ def learn_landscape(z_traj, dt, n_grid=160, z_min=-9.0, z_max=9.0,
     spec = MixedCVSpec(names=("z",), periods=(period,), origins=(z_min,),
                        units=("angstrom",))
 
+    # RADIAL GATE, as in measure_filter_D. Without it the 50 bulk K+ from the
+    # 0.15 M salt dominate: they span every z in the window, so coverage looks
+    # complete and the "landscape" learned is largely that of bulk water
+    # rather than the filter. On the 1 ns run this inflated apparent coverage
+    # from 15% to 100% and pushed the learned minima 0.65-2.19 A off the
+    # crystallographic sites.
+    Rr = None if r_traj is None else np.asarray(r_traj, float)
+    if Rr is not None and Rr.ndim == 1:
+        Rr = Rr[:, None]
+
     segs, ids = [], []
     for i in range(n_i):
         col = Z[:, i]
         inside = (col >= z_min) & (col <= z_max)
+        if Rr is not None:
+            inside = inside & (Rr[:, i] <= r_max)
         # contiguous runs only
         d = np.diff(inside.astype(int))
         starts = list(np.flatnonzero(d == 1) + 1) + ([0] if inside[0] else [])
@@ -601,12 +613,29 @@ def learn_landscape(z_traj, dt, n_grid=160, z_min=-9.0, z_max=9.0,
     info["n_harmonics"] = int(n_harmonics)
 
     import torch
+    # COVERAGE. A landscape is only measured where the trajectory has been.
+    # In a selectivity filter the ions sit in ~0.15 A wells and, without a
+    # permeation event, never cross between them: on a 1 ns KcsA run only 6
+    # of 40 bins across the window were ever visited. Fitting those and
+    # evaluating everywhere else is extrapolation, and reporting it as a
+    # learned landscape overstates the data by a long way.
+    hist, _ = np.histogram(zz, bins=40, range=(z_min, z_max))
+    covered = float((hist > 0).mean())
+
     z_out = np.linspace(z_min, z_max, n_grid, endpoint=False)
     th_out = spec.to_angles(z_out[:, None]).astype(np.float32)
     with torch.no_grad():
         F = model(torch.tensor(th_out)).numpy().astype(float)
     return {"z": z_out, "F": F - F.min(), "fit": info, "D_angle": D_ang,
-            "spec": spec, "n_segments": len(segs)}
+            "spec": spec, "n_segments": len(segs),
+            "coverage": covered,
+            "radially_gated": bool(Rr is not None),
+            "coverage_note": (
+                f"{100*covered:.0f}% of the window was visited; the rest is "
+                "extrapolation. A filter ion confined to its site cannot "
+                "constrain the barriers between sites -- that needs a "
+                "permeation event, enhanced sampling, or a literature PMF."),
+            "landscape_is_measured": bool(covered > 0.6)}
 
 
 def diffusion_in_angle_units(z, dt, traj_id, spec):
@@ -640,10 +669,22 @@ def permeation_graph_from_trajectory(z_traj, dt, traj_id=None, **kw):
         F_profile=learned["F"], z_profile=learned["z"],
         **{k: v for k, v in kw.items()
            if k in ("temperature", "c_in", "c_out", "sites")})
-    bg.meta["landscape_source"] = "LEARNED from trajectory (PHNN)"
+    cov = float(learned.get("coverage", 0.0))
+    ok = bool(learned.get("landscape_is_measured"))
+    bg.meta["landscape_source"] = (
+        "LEARNED from trajectory (PHNN)" if ok else
+        f"PHNN fitted to only {100*cov:.0f}% of the window -- MOSTLY "
+        "EXTRAPOLATED, not measured")
+    bg.meta["landscape_coverage"] = cov
     bg.meta["D_source"] = "measured from this trajectory"
     bg.meta["phnn_used"] = True
+    bg.meta["landscape_is_measured"] = ok
     bg.meta["D_is_measured"] = True
+    if not ok:
+        print(f"     WARNING: the trajectory visited only {100*cov:.0f}% of "
+              "the landscape window. The barriers between sites are not "
+              "constrained by this data; treat the landscape as a prior, not "
+              "a measurement.")
     bg.meta["phnn_fit"] = {k: v for k, v in learned["fit"].items()
                            if k in ("r2", "best_step", "n_bins_fit")}
     return bg, learned
@@ -899,6 +940,12 @@ def provenance_report(bg) -> dict:
         "phnn_used": bool(m.get("phnn_used")),
         "cavity_free_energy": ("parameterised" if m.get("cavity_F_parameterised")
                                else "n/a"),
+        "landscape_coverage": m.get("landscape_coverage"),
+        # fully_derived requires the landscape to be MEASURED, not merely
+        # produced by a network that ran. A PHNN fitted to 15% of the window
+        # is extrapolating, and saying otherwise is the overclaim this whole
+        # provenance mechanism exists to prevent.
         "fully_derived": bool(m.get("phnn_used") and m.get("D_is_measured")
-                              and m.get("site_source")),
+                              and m.get("site_source")
+                              and m.get("landscape_is_measured")),
     }

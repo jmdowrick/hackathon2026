@@ -306,10 +306,27 @@ def analyse():
         zs = np.array(sorted(sites.values()))
         learned = kcsa.learn_landscape(Z, dt, steps=3000,
                                        z_min=float(zs.min()) - 2.5,
-                                       z_max=float(zs.max()) + 2.5)
+                                       z_max=float(zs.max()) + 2.5,
+                                       r_traj=R, r_max=6.0)
+        cov = float(learned.get("coverage", 0.0))
+        measured = bool(learned.get("landscape_is_measured"))
+        print(f"  landscape coverage: {100*cov:.0f}% of the window visited")
+        if not measured:
+            print("  WARNING: the ions never left their sites, so the "
+                  "barriers BETWEEN sites are not constrained by this run. "
+                  "The landscape is a prior, not a measurement; D is the "
+                  "quantity this trajectory actually determines.")
+
         bg = kcsa.permeation_graph_from_structure(
             Dm["D_global"], F_profile=learned["F"], z_profile=learned["z"],
             phnn_used=True, D_is_measured=True)
+        # Do not let a network that merely RAN count as a measured landscape.
+        bg.meta["landscape_coverage"] = cov
+        bg.meta["landscape_is_measured"] = measured
+        bg.meta["landscape_source"] = (
+            "LEARNED from trajectory (PHNN)" if measured else
+            f"PHNN fitted to {100*cov:.0f}% of the window -- mostly "
+            "extrapolated; treat as a prior")
         bg.meta["trajectory"] = "rigid-protein KcsA in explicit water (this run)"
     except Exception as e:
         print(f"landscape learning failed ({e}); using the literature stand-in")
