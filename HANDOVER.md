@@ -40,6 +40,8 @@ invariant. Two tracks share the estimators:
 | `phgnn.py` | port-Hamiltonian GNN over the state graph |
 | `electro.py` | electrogenic bond graph, Hunter et al. formulation |
 | `delta.py` | state charge <sum delta(z_a)> and per-reaction z from stoichiometry |
+| `features.py` | permutation-invariant ion features (soft occupancy, count, Q); the ONE radial gate |
+| `gramicidin.py` | GA from 1JNO: pore frame, radius profile, channel window |
 | `kcsa.py` | KcsA specifics: sites, landscape, D from filter MD |
 | `pdb.py` | structure import, BIOMT assembly, pore frame, radius profile |
 | `thermo/` | generator, committor/MFPT, bond graph, CellML writer |
@@ -167,14 +169,21 @@ class of bug, grep for every place it could apply.
    gives the cavity-entry step real charge and Nernst still holds
    (`test_bath_steps_can_carry_charge_and_nernst_still_holds`) -- a modelling
    decision for the user, not made here.
-3. **Multi-ion CV space**, with permutation-invariant features — sorted
-   positions or per-site occupancy counts. Raw `(z1,z2,z3)` jumps ~29x on a
-   relabelling that is physically nothing. Note: atom-indexed tracking is
-   *correct* for D; invariance is needed for the CV/state space only.
-4. **Target choice.** KcsA may be wrong for the next step. **Gramicidin A** is
-   single-file and predominantly single-ion, so the one-ion bond graph is the
-   *correct* structure rather than an approximation; ~25k atoms, decades of
-   published PMFs, still electrogenic.
+3. **Multi-ion CV space — built (`features.py`).** Soft per-basis-centre
+   occupancies (a partition of unity, so they sum to the channel ion count),
+   the count itself, and Q. All sums over ions: relabelling is exactly
+   nothing. Sorted positions were rejected -- they teleport when an ion
+   enters. Basis centres, not sites: the sites are for the SRV to find.
+   `in_channel` is the single radial gate; `delta.frame_charges` uses it too
+   (it had none -- bug 2's class again).
+4. **Target: gramicidin A — decided.** Single-file, predominantly
+   single-ion, so the one-ion bond graph is the correct structure.
+   `gramicidin.load_gramicidin()` reads 1JNO (SDS micelle NMR; no resolved
+   ions, so sites are NOT taken from it). Two traps found on the way in:
+   half of GA is HETATM (D-residues, caps), so `pdb.radius_profile` needs
+   `wall_mask=non_solvent(s)`; and the formyl-valine midpoint is off the
+   helix axis, so the origin is projected onto it. The dimer's two-fold
+   symmetry (profile mirror-symmetric to 0.001 A) checks the frame.
 
 ---
 
@@ -201,13 +210,18 @@ coordinate -> weighted ensemble (WESTPA) for barrier coverage -> PHNN for H
 and D -> bond graph. Do **not** combine WE and Girsanov; they solve the same
 problem by opposite means and stacking them corrects twice.
 
+**Agreed (2026-10-20):** pivot to gramicidin A and build that stack. Done:
+features, GA frame, delta. Next: a bilayer MD system for GA (1JNO in a
+DMPC/POPC membrane, ~25k atoms, OpenMM), short unbiased runs -> SRV
+(deeptime is installed) -> WESTPA (not installed) along the SRV coordinate.
+
 ---
 
 ## 7. Running it
 
 ```bash
 source .venv/bin/activate
-make test                 # 94 fast tests, ~5 s. Run after every change.
+make test                 # 105 fast tests, ~5 s. Run after every change.
 python -m pytest tests/ -q        # includes slow training tests, ~3 min
 python scripts/mutation_audit.py  # are the tests able to fail?
 make toy                  # exact ground truth, ~20 s

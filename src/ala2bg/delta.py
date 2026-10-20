@@ -87,25 +87,37 @@ def delta_profile_fn(z_profile, delta_profile):
     return f
 
 
-def frame_charges(z_ions, delta_fn, window=None):
+def frame_charges(z_ions, delta_fn, window=None, r_ions=None, r_max=None):
     """Q(x) = sum of delta over the ions inside the window, per frame.
 
     z_ions : (n_frames, n_ions) membrane-normal ion positions in the SAME frame
              as the delta profile. NaN marks an absent ion (padding).
+    r_ions : (n_frames, n_ions) distance from the pore axis. With r_max, ions
+             outside the radial gate are excluded -- an ion at the right z but
+             bound to a lipid headgroup is not in the pore (bug 2). Without it
+             the caller is asserting the ions are already gated.
     Returns (Q, n_in): the charge and the number of ions in the window.
     """
+    from .features import Channel, in_channel
     Z = np.asarray(z_ions, float)
     if Z.ndim == 1:
         Z = Z[:, None]
     lo, hi = window if window is not None else delta_fn.window
     present = np.isfinite(Z)
-    inside = present & (Z >= lo) & (Z <= hi)
+    if (r_ions is None) != (r_max is None):
+        raise ValueError("give both r_ions and r_max, or neither")
+    if r_ions is None:
+        inside = present & (Z >= lo) & (Z <= hi)
+    else:
+        R = np.asarray(r_ions, float).reshape(Z.shape)
+        inside = in_channel(Z, R, Channel(lo, hi, float(r_max), width=0.0),
+                            soft=False).astype(bool)
     d = np.where(inside, delta_fn(np.where(present, Z, lo)), 0.0)
     return d.sum(axis=1), inside.sum(axis=1)
 
 
 def state_charges(z_ions, labels, n_states, delta_fn, weights=None,
-                  window=None):
+                  window=None, r_ions=None, r_max=None):
     """Per-state displacement charge <Q>_i from labelled frames.
 
     labels  : (n_frames,) metastable-state index per frame; negative = not
@@ -118,7 +130,7 @@ def state_charges(z_ions, labels, n_states, delta_fn, weights=None,
     consecutive MD frames are correlated.
     """
     labels = np.asarray(labels, int)
-    Qf, n_in = frame_charges(z_ions, delta_fn, window)
+    Qf, n_in = frame_charges(z_ions, delta_fn, window, r_ions, r_max)
     if len(labels) != len(Qf):
         raise ValueError(f"{len(labels)} labels for {len(Qf)} frames")
     w = np.ones(len(Qf)) if weights is None else np.asarray(weights, float)
@@ -150,6 +162,7 @@ def state_charges(z_ions, labels, n_states, delta_fn, weights=None,
         "Q": Q, "se_iid_lower_bound": se, "n_eff": n_eff,
         "count_purity": purity, "modal_ion_count": modal_count,
         "unvisited_states": missing,
+        "radially_gated": r_ions is not None,
         "note": ("Q_i = <sum_a delta(z_a)>_i over ions in the field window. "
                  "se treats frames as independent: a lower bound."),
     }

@@ -137,6 +137,30 @@ MUTATIONS = [
      "    w = np.ones(len(Qf))",
      "weighted-ensemble weights enter the state charge",
      "test_we_weights_enter_as_weights"),
+
+    ("radial gate removed from features", "features.py",
+     "         * _sigmoid((ch.r_max - np.where(np.isfinite(rr), rr, 1e9)) / w))",
+     "         * 1.0)",
+     "bulk ions at the right z are not channel ions (bug 2)",
+     "test_radial_gate_excludes_bulk_ion_at_channel_z"),
+
+    ("minimum image skipped", "features.py",
+     "        d = d - L * np.round(d / L)",
+     "        d = d",
+     "ions across a periodic boundary are still at the pore",
+     "test_minimum_image_keeps_an_ion_in_the_pore"),
+
+    ("GA wall drops HETATM", "gramicidin.py",
+     "    wall = pdb.non_solvent(s)",
+     "    wall = ~s.is_hetatm",
+     "GA's D-residues line the pore",
+     "test_ga_wall_includes_d_residues"),
+
+    ("GA origin off the helix axis", "gramicidin.py",
+     "    origin = c + np.dot(junction - c, axis) * axis",
+     "    origin = junction",
+     "radii are measured from the helix axis",
+     "test_ga_lumen_is_not_clipped_by_an_off_axis_origin"),
 ]
 
 

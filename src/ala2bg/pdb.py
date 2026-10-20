@@ -181,10 +181,28 @@ def ion_sites(s: Structure, origin, axis, ion="K", max_radius_A=2.5):
     return zs, rs
 
 
+# Solvent and ion residue names. HETATM is NOT a synonym for "not protein":
+# gramicidin's D-residues (DLE, DVA) and its formyl/ethanolamine caps are all
+# HETATM in 1JNO -- half the atoms -- and dropping them doubles the apparent
+# pore radius at the channel entrances.
+SOLVENT_AND_IONS = ("HOH", "WAT", "DOD", "SOL", "K", "NA", "CL", "CA", "MG",
+                    "RB", "CS", "LI", "ZN", "SO4", "PO4")
+
+
+def non_solvent(s: Structure):
+    """Mask of every atom that is not water or a simple ion."""
+    return ~np.isin(s.resname, SOLVENT_AND_IONS)
+
+
 def radius_profile(s: Structure, origin, axis, z_edges, probe_A=1.4,
-                   heavy_only=True):
-    """Pore radius per slab: minimum clearance to a protein heavy atom."""
-    m = ~s.is_hetatm
+                   heavy_only=True, wall_mask=None):
+    """Pore radius per slab: minimum clearance to a protein heavy atom.
+
+    wall_mask selects the atoms that line the pore. The default, ATOM records
+    only, is right for 1K4C (whose HETATM are ions, water and lipid) and wrong
+    for any peptide with non-standard residues; pass non_solvent(s) there.
+    """
+    m = ~s.is_hetatm if wall_mask is None else np.asarray(wall_mask, bool)
     if heavy_only:
         m &= s.element != "H"
     P = s.xyz[m] - origin
