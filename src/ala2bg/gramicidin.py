@@ -98,3 +98,231 @@ def channel_from_structure(g, r_gate_A=4.0, margin_A=2.0):
     from .features import Channel
     zc = sorted(g["cterm_z_A"])
     return Channel(zc[0] - margin_A, zc[1] + margin_A, r_gate_A)
+
+
+# ---------------------------------------------------------------------------
+# Force field: Amber ff14SB + lipid17, with two cap templates
+# ---------------------------------------------------------------------------
+#
+# WHY AMBER, AND WHY THE D-RESIDUES NEED NO PARAMETERS. Every ff14SB proper
+# torsion has phase 0 or pi and there is no CMAP, so every term in the energy
+# is EVEN under mirror inversion. A D-residue on the L template is therefore
+# the exact mirror image of the L-residue -- not an approximation.
+# test_ga_energy_is_mirror_invariant checks it on the real dimer. CHARMM36's
+# CMAP is fitted to L-residues and would not have this property.
+#
+# THE CAPS. Every bonded term already exists in ff14SB: H5 is Amber's formyl
+# hydrogen (C-H5, H5-C-N, H5-C-O), and ethanolamine is serine-like CT/OH.
+# Only the CHARGES are new, and they are by ANALOGY, not a RESP fit:
+#   formyl       = ACE with the methyl group's net charge (-0.0293) on HN
+#   ethanolamine = NME amide (N, H) + serine CB/OG/HG, with CA set so the
+#                  residue is neutral
+# The formyls sit at the dimer junction (the central barrier) and the
+# ethanolamines at the mouths (the entrance sites), so these charges are a
+# declared, testable choice, not a detail.
+
+GA_CAP_TEMPLATES = """<ForceField>
+ <Residues>
+  <Residue name="FVA">
+   <Atom name="CN"   type="protein-C"  charge="0.5972"/>
+   <Atom name="O1"   type="protein-O"  charge="-0.5679"/>
+   <Atom name="HN"   type="protein-H5" charge="-0.0293"/>
+   <Atom name="N"    type="protein-N"  charge="-0.4157"/>
+   <Atom name="H"    type="protein-H"  charge="0.2719"/>
+   <Atom name="CA"   type="protein-CX" charge="-0.0875"/>
+   <Atom name="HA"   type="protein-H1" charge="0.0969"/>
+   <Atom name="CB"   type="protein-3C" charge="0.2985"/>
+   <Atom name="HB"   type="protein-HC" charge="-0.0297"/>
+   <Atom name="CG1"  type="protein-CT" charge="-0.3192"/>
+   <Atom name="HG11" type="protein-HC" charge="0.0791"/>
+   <Atom name="HG12" type="protein-HC" charge="0.0791"/>
+   <Atom name="HG13" type="protein-HC" charge="0.0791"/>
+   <Atom name="CG2"  type="protein-CT" charge="-0.3192"/>
+   <Atom name="HG21" type="protein-HC" charge="0.0791"/>
+   <Atom name="HG22" type="protein-HC" charge="0.0791"/>
+   <Atom name="HG23" type="protein-HC" charge="0.0791"/>
+   <Atom name="C"    type="protein-C"  charge="0.5973"/>
+   <Atom name="O"    type="protein-O"  charge="-0.5679"/>
+   <Bond atomName1="CN" atomName2="O1"/>
+   <Bond atomName1="CN" atomName2="HN"/>
+   <Bond atomName1="CN" atomName2="N"/>
+   <Bond atomName1="N" atomName2="H"/>
+   <Bond atomName1="N" atomName2="CA"/>
+   <Bond atomName1="CA" atomName2="HA"/>
+   <Bond atomName1="CA" atomName2="CB"/>
+   <Bond atomName1="CA" atomName2="C"/>
+   <Bond atomName1="CB" atomName2="HB"/>
+   <Bond atomName1="CB" atomName2="CG1"/>
+   <Bond atomName1="CB" atomName2="CG2"/>
+   <Bond atomName1="CG1" atomName2="HG11"/>
+   <Bond atomName1="CG1" atomName2="HG12"/>
+   <Bond atomName1="CG1" atomName2="HG13"/>
+   <Bond atomName1="CG2" atomName2="HG21"/>
+   <Bond atomName1="CG2" atomName2="HG22"/>
+   <Bond atomName1="CG2" atomName2="HG23"/>
+   <Bond atomName1="C" atomName2="O"/>
+   <ExternalBond atomName="C"/>
+  </Residue>
+  <Residue name="ETA">
+   <Atom name="N"   type="protein-N"  charge="-0.4157"/>
+   <Atom name="H"   type="protein-H"  charge="0.2719"/>
+   <Atom name="CA"  type="protein-CT" charge="-0.1064"/>
+   <Atom name="HA1" type="protein-H1" charge="0.0976"/>
+   <Atom name="HA2" type="protein-H1" charge="0.0976"/>
+   <Atom name="C"   type="protein-CT" charge="0.2117"/>
+   <Atom name="HB1" type="protein-H1" charge="0.0352"/>
+   <Atom name="HB2" type="protein-H1" charge="0.0352"/>
+   <Atom name="O"   type="protein-OH" charge="-0.6546"/>
+   <Atom name="HO"  type="protein-HO" charge="0.4275"/>
+   <Bond atomName1="N" atomName2="H"/>
+   <Bond atomName1="N" atomName2="CA"/>
+   <Bond atomName1="CA" atomName2="HA1"/>
+   <Bond atomName1="CA" atomName2="HA2"/>
+   <Bond atomName1="CA" atomName2="C"/>
+   <Bond atomName1="C" atomName2="HB1"/>
+   <Bond atomName1="C" atomName2="HB2"/>
+   <Bond atomName1="C" atomName2="O"/>
+   <Bond atomName1="O" atomName2="HO"/>
+   <ExternalBond atomName="N"/>
+  </Residue>
+ </Residues>
+</ForceField>
+"""
+
+# D-residues use the L templates: exact, by the mirror argument above.
+D_TO_L = {"DLE": "LEU", "DVA": "VAL"}
+
+
+def forcefield():
+    """amber14-all (ff14SB + lipid17) + TIP3P + the GA cap templates."""
+    import io
+    from openmm import app
+    return app.ForceField("amber14-all.xml", "amber14/tip3p.xml",
+                          io.StringIO(GA_CAP_TEMPLATES))
+
+
+def openmm_model(g=None):
+    """GA as an OpenMM (topology, positions), rotated into the pore frame.
+
+    The membrane builder takes the membrane normal as z and centres the
+    bilayer at z = 0, so the structure is placed with the channel axis on z
+    and the dimer junction at the origin -- the same frame as
+    load_gramicidin(), which is what lets features and delta be read off a
+    trajectory without a frame conversion (bug 3 was a 5.89 A one).
+    """
+    import io
+    from openmm import app, unit
+
+    g = g or load_gramicidin()
+    lines = []
+    for line in open(g["path"]):
+        if line.startswith(("ATOM", "HETATM")):
+            if line[21] not in "AB":
+                continue
+            rn = line[17:20]
+            if rn in D_TO_L:
+                line = line[:17] + D_TO_L[rn] + line[20:]
+        elif line.startswith(("CONECT", "LINK", "MODEL", "ENDMDL", "TER")):
+            continue
+        lines.append(line)
+    pdbf = app.PDBFile(io.StringIO("".join(lines)))
+    top = pdbf.topology
+
+    # Rotation taking the pore axis to +z.
+    a = np.asarray(g["axis"], float)
+    ez = np.array([0.0, 0.0, 1.0])
+    v, c = np.cross(a, ez), float(np.dot(a, ez))
+    if np.linalg.norm(v) < 1e-12:
+        R = np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
+    else:
+        vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+        R = np.eye(3) + vx + vx @ vx / (1.0 + c)
+    X = pdbf.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
+    X = (X - g["origin"]) @ R.T
+
+    # Bonds the templates need but PDBFile does not make: within the caps,
+    # and the peptide links into and out of them. By distance, so nothing is
+    # taken on trust from CONECT records that were stripped above.
+    atoms = list(top.atoms())
+    have = {frozenset((b[0].index, b[1].index)) for b in top.bonds()}
+    caps = [i for i, at in enumerate(atoms) if at.residue.name in ("FVA", "ETA")]
+    for i in caps:
+        for j, at in enumerate(atoms):
+            if j == i or frozenset((i, j)) in have:
+                continue
+            ei, ej = atoms[i].element.symbol, at.element.symbol
+            cut = 1.25 if "H" in (ei, ej) else 1.75
+            same_chain = atoms[i].residue.chain is at.residue.chain
+            if same_chain and np.linalg.norm(X[i] - X[j]) < cut:
+                top.addBond(atoms[i], at)
+                have.add(frozenset((i, j)))
+    pos = unit.Quantity([tuple(x) for x in X / 10.0], unit.nanometer)
+    return top, pos
+
+
+def unexplained_missing_torsions(top, system, ff,
+                                 ff_file="amber14/protein.ff14SB.xml"):
+    """Proper torsions absent from the system that the force field does not
+    explicitly set to zero.
+
+    OpenMM drops a proper torsion SILENTLY when no parameter matches -- and
+    also, legitimately, when the matching parameter has zero barrier (ff14SB
+    sets e.g. X-CT-N-X to k = 0, as Amber's parm10 does). Only the first is a
+    defect, and createSystem cannot tell them apart. This can: every torsion
+    in the bond graph must be either in the system or matched by an explicit
+    k = 0 entry. Returns the ones that are neither, as atom-name strings.
+    """
+    import os
+    import xml.etree.ElementTree as ET
+    import openmm as mm
+    from openmm import app
+
+    root = ET.parse(os.path.join(os.path.dirname(app.__file__), "data",
+                                 ff_file)).getroot()
+    zero = []
+    for p in root.find("PeriodicTorsionForce"):
+        if p.tag != "Proper":
+            continue
+        ks = [float(v) for k, v in p.attrib.items() if k.startswith("k")]
+        if ks and all(k == 0.0 for k in ks):
+            zero.append(tuple(p.get(f"type{i}") or "" for i in (1, 2, 3, 4)))
+
+    atype = {}
+    for res, tpl in zip(top.residues(), ff.getMatchingTemplates(top)):
+        byname = {a.name: a.type for a in tpl.atoms}
+        for at in res.atoms():
+            atype[at.index] = byname[at.name]
+
+    def matches_zero(q):
+        t = tuple(atype[i] for i in q)
+        for z in zero:
+            for tt in (t, t[::-1]):
+                if all(zz == "" or zz == x for zz, x in zip(z, tt)):
+                    return True
+        return False
+
+    tf = [f for f in system.getForces()
+          if isinstance(f, mm.PeriodicTorsionForce)][0]
+    have = set()
+    for n in range(tf.getNumTorsions()):
+        q = tuple(tf.getTorsionParameters(n)[:4])
+        have.add(min(q, q[::-1]))
+
+    nbr = {a.index: set() for a in top.atoms()}
+    for b in top.bonds():
+        nbr[b[0].index].add(b[1].index)
+        nbr[b[1].index].add(b[0].index)
+    atoms = list(top.atoms())
+    bad, seen = [], set()
+    for j in nbr:
+        for k in nbr[j]:
+            for i in nbr[j] - {k}:
+                for l in nbr[k] - {j, i}:
+                    q = min((i, j, k, l), (l, k, j, i))
+                    if q in seen:
+                        continue
+                    seen.add(q)
+                    if q not in have and not matches_zero(q):
+                        bad.append("-".join(f"{atoms[x].residue.name}:"
+                                            f"{atoms[x].name}" for x in q))
+    return bad

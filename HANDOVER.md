@@ -41,7 +41,7 @@ invariant. Two tracks share the estimators:
 | `electro.py` | electrogenic bond graph, Hunter et al. formulation |
 | `delta.py` | state charge <sum delta(z_a)> and per-reaction z from stoichiometry |
 | `features.py` | permutation-invariant ion features (soft occupancy, count, Q); the ONE radial gate |
-| `gramicidin.py` | GA from 1JNO: pore frame, radius profile, channel window |
+| `gramicidin.py` | GA from 1JNO: pore frame, radius profile, channel window, ff14SB cap templates, torsion audit |
 | `kcsa.py` | KcsA specifics: sites, landscape, D from filter MD |
 | `pdb.py` | structure import, BIOMT assembly, pore frame, radius profile |
 | `thermo/` | generator, committor/MFPT, bond graph, CellML writer |
@@ -149,12 +149,8 @@ class of bug, grep for every place it could apply.
 
 ## 5. Open problems, in priority order
 
-1. **Two free gates, before any compute.**
-   - *Identifiability*: profile the existing bond graph. If several parameter
-     sets fit flux data equally well, no structural prediction is falsifiable.
-     Testable now, no simulation. Could stop the programme.
-   - *Novelty*: check Gawthrop's publication list; search "bond graph" with
-     "potential of mean force" / "Markov state model".
+1. *(Removed 2026-10-20: the identifiability and novelty gates were
+   descoped by the user.)*
 2. **The delta mapping — built (`delta.py`).** Not "mean ion z per state":
    that is wrong for multi-ion states (sum, not mean), for the nonlinear
    geometric delta (Jensen), and for closure (a state function telescopes to
@@ -211,9 +207,19 @@ and D -> bond graph. Do **not** combine WE and Girsanov; they solve the same
 problem by opposite means and stacking them corrects twice.
 
 **Agreed (2026-10-20):** pivot to gramicidin A and build that stack. Done:
-features, GA frame, delta. Next: a bilayer MD system for GA (1JNO in a
-DMPC/POPC membrane, ~25k atoms, OpenMM), short unbiased runs -> SRV
-(deeptime is installed) -> WESTPA (not installed) along the SRV coordinate.
+features, GA frame, delta, and the membrane system (`scripts/ga_md.py
+--prepare`): 1JNO in DMPC, 25,388 atoms, 0.15 M KCl, Amber ff14SB/lipid17,
+11 post-build checks incl. the frame RE-MEASURED after addMembrane. Force
+field: D-residues on L templates are exact (ff14SB torsion phases are all
+0/pi, no CMAP; mirror energy equal to 5e-13 kJ/mol). Cap CHARGES are by
+analogy (ACE; NME + Ser), not RESP -- a declared choice at the two places
+that matter most (junction, mouths). OpenMM silently drops unmatched
+torsions; `unexplained_missing_torsions` separates those from ff14SB's
+deliberate k=0 terms. ~0.6 s/ps locally.
+
+Next: staged equilibration (NPT, MonteCarloMembraneBarostat, GA restraints
+released in steps) and an HPC runner like run_kcsa.py; then unbiased runs
+-> SRV (deeptime) -> WESTPA (not installed).
 
 ---
 
@@ -221,7 +227,7 @@ DMPC/POPC membrane, ~25k atoms, OpenMM), short unbiased runs -> SRV
 
 ```bash
 source .venv/bin/activate
-make test                 # 105 fast tests, ~5 s. Run after every change.
+make test                 # 109 fast tests, ~5 s. Run after every change.
 python -m pytest tests/ -q        # includes slow training tests, ~3 min
 python scripts/mutation_audit.py  # are the tests able to fail?
 make toy                  # exact ground truth, ~20 s

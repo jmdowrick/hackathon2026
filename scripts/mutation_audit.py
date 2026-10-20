@@ -161,6 +161,18 @@ MUTATIONS = [
      "    origin = junction",
      "radii are measured from the helix axis",
      "test_ga_lumen_is_not_clipped_by_an_off_axis_origin"),
+
+    ("formyl charge not neutralised", "gramicidin.py",
+     '   <Atom name="HN"   type="protein-H5" charge="-0.0293"/>',
+     '   <Atom name="HN"   type="protein-H5" charge="0.0293"/>',
+     "every GA residue is neutral",
+     "test_every_residue_is_neutral"),
+
+    ("GA not rotated into the pore frame", "gramicidin.py",
+     "    X = (X - g[\"origin\"]) @ R.T",
+     "    X = (X - g[\"origin\"])",
+     "the MD frame is the analysis frame (bug 3's class)",
+     "test_ga_topology_is_complete_and_in_the_pore_frame"),
 ]
 
 
