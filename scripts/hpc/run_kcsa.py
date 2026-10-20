@@ -50,8 +50,23 @@ def main():
 
     d = a.dir
     system = XmlSerializer.deserialize(open(os.path.join(d, "system.xml")).read())
-    topology = pickle.load(open(os.path.join(d, "topology.pkl"), "rb"))
     pdb = app.PDBFile(os.path.join(d, "minimised.pdb"))
+
+    # Rebuild the topology from the PDB rather than unpickling it. A pickled
+    # OpenMM Topology is tied to the OpenMM and Python versions that wrote it,
+    # and the cluster will not generally have the same ones -- that failure
+    # would land AFTER queueing. The PDB was written from the same Modeller,
+    # so the atom order matches system.xml; the assertion below checks that
+    # rather than assuming it.
+    topology = pdb.topology
+    if topology.getNumAtoms() != system.getNumParticles():
+        pkl = os.path.join(d, "topology.pkl")
+        if os.path.exists(pkl):
+            topology = pickle.load(open(pkl, "rb"))
+        if topology.getNumAtoms() != system.getNumParticles():
+            raise ValueError(
+                f"topology has {topology.getNumAtoms()} atoms but the system "
+                f"has {system.getNumParticles()}; the bundle is inconsistent")
     meta = json.load(open(os.path.join(d, "system.json")))
 
     integrator = LangevinMiddleIntegrator(298 * unit.kelvin, 1 / unit.picosecond,

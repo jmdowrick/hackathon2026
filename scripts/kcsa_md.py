@@ -270,10 +270,22 @@ def analyse():
 
     d = np.load(f"{OUT}/filter_ions.npz", allow_pickle=True)
     Z, dt = d["Z"], float(d["dt_ps"])
+    R = d["R"] if "R" in d.files else None
     print(f"{Z.shape[0]} frames x {Z.shape[1]} ions, dt = {dt} ps")
 
-    Dm = kcsa.measure_filter_D(Z, dt)
-    stab = kcsa.D_lag_stability(Z, dt)
+    # RADIAL GATE. Without it a bulk ion 30 A off-axis at the same height
+    # counts as being in the filter and D comes out ~29x too high -- above
+    # bulk K+, which is impossible for a confined ion. The runner records r
+    # for exactly this reason, so refuse to proceed silently without it.
+    if R is None:
+        raise ValueError(
+            "filter_ions.npz has no R array. Re-run with the current "
+            "run_kcsa.py: D cannot be measured from the axial coordinate "
+            "alone without counting bulk ions as filter ions.")
+
+    Dm = kcsa.measure_filter_D(Z, dt, r_traj=R, r_max=6.0)
+    stab = kcsa.D_lag_stability(Z, dt, r_traj=R, r_max=6.0)
+    print(f"  radially gated at r <= 6 A: {Dm['n_pairs']} pairs")
     print(f"D = {Dm['D_global']:.5f} A^2/ps from {Dm['n_pairs']} pairs; "
           f"lag stability {stab['max_ratio']:.2f} (markovian {stab['markovian']})")
 

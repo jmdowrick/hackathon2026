@@ -281,6 +281,9 @@ def measure_filter_D(z_traj, dt, z_min=-9.0, z_max=9.0, lag=1,
 
 
 def D_lag_stability(z_traj, dt, lags=(1, 2, 5, 10), **kw):
+    """Note: pass r_traj/r_max through **kw -- an ungated lag scan mixes bulk
+    and filter ions and the lag dependence then measures the mixture, not the
+    coordinate."""
     """Is the filter D lag-independent?
 
     Confined motion in a site makes apparent D fall with lag, exactly as the

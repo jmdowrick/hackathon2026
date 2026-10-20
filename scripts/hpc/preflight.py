@@ -164,10 +164,29 @@ def main():
           f"partial={bool(out['partial'])}")
 
     print("\n6. PHYSICS SANITY")
-    from ala2bg import kcsa
-    ungated = kcsa.measure_filter_D(Z, dt)
-    gated = kcsa.measure_filter_D(Z, dt, r_traj=R, r_max=6.0)
-    check("radial gating is actually applied", gated.get("radially_gated") is True)
+
+    # Computed inline rather than imported, so this script runs on a cluster
+    # that has only openmm and numpy. It previously imported ala2bg, which
+    # made the "run preflight on the cluster first" advice impossible to
+    # follow.
+    def measure_D(Z, R, dt, z_max=9.0, r_max=None):
+        z0, z1 = Z[:-1], Z[1:]
+        ok = (np.abs(z0) <= z_max) & (np.abs(z1) <= z_max)
+        if r_max is not None:
+            ok &= (R[:-1] <= r_max) & (R[1:] <= r_max)
+        if not ok.any():
+            return None, 0
+        dz = (z1 - z0)[ok]
+        return float(np.mean(dz ** 2) / (2 * dt)), int(ok.sum())
+
+    D_ungated, _ = measure_D(Z, R, dt, r_max=None)
+    D_gated, n_pairs = measure_D(Z, R, dt, r_max=6.0)
+    gated = {"D_global": D_gated, "n_pairs": n_pairs,
+             "available": D_gated is not None}
+    ungated = {"D_global": D_ungated, "available": D_ungated is not None}
+    check("radial gating changes the answer",
+          D_gated is not None and D_ungated is not None
+          and abs(D_gated - D_ungated) > 1e-6)
     if ungated.get("available") and gated.get("available"):
         check("radial gating lowers D",
               gated["D_global"] < ungated["D_global"],
@@ -180,11 +199,41 @@ def main():
         check("enough displacement pairs to mean anything",
               gated["n_pairs"] > 200, f"{gated['n_pairs']} pairs")
 
-    zf = Z[(np.abs(Z) <= 9) & (R <= 6)]
-    if zf.size:
-        check("ions sample the filter region",
-              float(zf.min()) < 0 < float(zf.max()),
-              f"z range {zf.min():.1f} .. {zf.max():.1f} A")
+    # What matters is that ions are IN the filter, ON the axis and CONFINED
+    # -- not that they straddle z = 0, which is only the Thr75 CA plane and
+    # an arbitrary landmark. The first version asserted the latter and failed
+    # on perfectly good data where all three ions sat above that plane.
+    gate = (np.abs(Z) <= 9) & (R <= 6)
+    per_ion = gate.sum(axis=0)
+    resident = per_ion > 0.5 * len(Z)
+    check("ions are resident in the filter",
+          int(resident.sum()) >= 2,
+          f"{int(resident.sum())} ions gated for >50% of frames")
+
+    if resident.any():
+        zf = Z[:, resident][gate[:, resident]]
+        rf = R[:, resident][gate[:, resident]]
+        check("resident ions are on the pore axis",
+              float(np.median(rf)) < 1.5,
+              f"median r = {float(np.median(rf)):.2f} A")
+        check("resident ions are confined, not diffusing freely",
+              float(np.median(Z[:, resident].std(axis=0))) < 1.5,
+              f"median per-ion z spread "
+              f"{float(np.median(Z[:, resident].std(axis=0))):.2f} A")
+        check("filter occupancy spans more than one site",
+              float(zf.max() - zf.min()) > 3.0,
+              f"gated z span {float(zf.max()-zf.min()):.1f} A "
+              f"(site spacing ~3.3 A)")
+
+        # Reported, not asserted: a short equilibration leaves the ions
+        # relaxed off the crystallographic sites. Worth watching on the real
+        # run, where equilibration is 200 ps rather than a few.
+        placed = np.array(meta.get("ion_z_A", []), dtype=float)
+        if placed.size:
+            final = Z[-1, resident]
+            drift = [float(np.min(np.abs(placed - f))) for f in final]
+            print(f"     (info) resident ions sit {np.round(drift,2)} A from "
+                  f"the nearest placed site")
 
     return summary()
 
