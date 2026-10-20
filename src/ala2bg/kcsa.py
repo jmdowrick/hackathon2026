@@ -537,20 +537,20 @@ def permeation_graph(D_filter, max_barrier_kJ=10.5, temperature=298.0,
         delta = electrical_distances(zpos, zpos.min(), zpos.max())
         field_note = "uniform-field assumption (declared simplification)"
     if include_empty:
-        # ASSIGN THE CHARGES EXPLICITLY. Telescoping delta over a state list
-        # that contains E gives [.., -1, +1]: the bath steps carry a whole
-        # charge each and the filter traversal carries none, which is upside
-        # down. E has no ion, so it has no electrical position -- and it is
-        # reached from BOTH faces, so no single delta can be right.
-        #
-        # Physically the bath steps move an ion between a reservoir and the
-        # adjacent site at the SAME membrane face, traversing ~none of the
-        # field; the charge moves as the ion crosses the filter. So the
-        # filter hops telescope to +1 and both bath steps carry 0.
-        z = np.zeros(len(edges))
-        for r, (i, j) in enumerate(edges[:len(edges) - 2]):
-            z[r] = delta[j] - delta[i]
-        z[:len(edges) - 2] *= 1.0 / max(z[:len(edges) - 2].sum(), 1e-12)
+        # Telescoping delta over a state list that contains E gives
+        # [.., -1, +1]: E has no ion, so it has no electrical POSITION -- but
+        # it does have a CHARGE, Q_E = 0, and the bath species carry the rest.
+        # Charges then follow from stoichiometry (see delta.py), and closure
+        # holds for any Q. With delta renormalised over the sites, as above,
+        # S4 sits at 0 and S0 at 1, so both bath steps carry 0 and the filter
+        # hops carry the full charge -- a modelling choice made by that
+        # renormalisation, not by the charge bookkeeping.
+        from .delta import reaction_charges_from_states
+        Q = delta.copy()
+        Q[names.index("E")] = 0.0
+        z = reaction_charges_from_states(
+            Q, edges, transits,
+            species_delta={"K_in": 0.0, "K_out": 1.0, "K_ref": None})
     else:
         z = reaction_charges(delta, edges, z_ion=1.0)
 

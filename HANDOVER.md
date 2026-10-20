@@ -39,6 +39,7 @@ invariant. Two tracks share the estimators:
 | `surrogate.py` | simulate the learned SDE to generate unlimited statistics |
 | `phgnn.py` | port-Hamiltonian GNN over the state graph |
 | `electro.py` | electrogenic bond graph, Hunter et al. formulation |
+| `delta.py` | state charge <sum delta(z_a)> and per-reaction z from stoichiometry |
 | `kcsa.py` | KcsA specifics: sites, landscape, D from filter MD |
 | `pdb.py` | structure import, BIOMT assembly, pore frame, radius profile |
 | `thermo/` | generator, committor/MFPT, bond graph, CellML writer |
@@ -152,10 +153,20 @@ class of bug, grep for every place it could apply.
      Testable now, no simulation. Could stop the programme.
    - *Novelty*: check Gawthrop's publication list; search "bond graph" with
      "potential of mean force" / "Markov state model".
-2. **The delta mapping.** Woodhull electrical distance needs a *physical*
-   membrane-normal position. A learned/latent CV has none. Mapping back (mean
-   ion z per metastable state) is the one genuinely unbuilt piece in the
-   chain, and where the electrogenic half could become unmoored.
+2. **The delta mapping — built (`delta.py`).** Not "mean ion z per state":
+   that is wrong for multi-ion states (sum, not mean), for the nonlinear
+   geometric delta (Jensen), and for closure (a state function telescopes to
+   0). Instead Q_i = <sum_a delta(z_a)>_i over ions in the field window, the
+   linear-response gating charge; z_r = Q_b - Q_a + bath-species deltas.
+   Permutation-invariant by construction, WE weights enter as plain weights,
+   closure is structural. `permeation_graph` now uses it (bit-identical
+   output). Still open: (a) `count_purity` must be ~1 per state, i.e. the
+   states must resolve the window ion count -- a test of the CV, not of this
+   code; (b) `permeation_graph` still renormalises delta over the SITES, so
+   the bath steps carry zero charge by choice. Unrenormalised geometric delta
+   gives the cavity-entry step real charge and Nernst still holds
+   (`test_bath_steps_can_carry_charge_and_nernst_still_holds`) -- a modelling
+   decision for the user, not made here.
 3. **Multi-ion CV space**, with permutation-invariant features — sorted
    positions or per-site occupancy counts. Raw `(z1,z2,z3)` jumps ~29x on a
    relabelling that is physically nothing. Note: atom-indexed tracking is
@@ -196,7 +207,7 @@ problem by opposite means and stacking them corrects twice.
 
 ```bash
 source .venv/bin/activate
-make test                 # 83 fast tests, ~5 s. Run after every change.
+make test                 # 94 fast tests, ~5 s. Run after every change.
 python -m pytest tests/ -q        # includes slow training tests, ~3 min
 python scripts/mutation_audit.py  # are the tests able to fail?
 make toy                  # exact ground truth, ~20 s

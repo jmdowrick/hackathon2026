@@ -118,6 +118,25 @@ MUTATIONS = [
      "        return torch.cat([hi + 1.3 * hj, hi - hj], dim=-1)",
      "kappa_ij == kappa_ji by construction",
      "test_phgnn_kappa_is_symmetric_by_construction"),
+
+    ("delta of the mean ion position", "delta.py",
+     "    return d.sum(axis=1), inside.sum(axis=1)",
+     "    zbar = np.nanmean(np.where(inside, Z, np.nan), axis=1)\n"
+     "    return np.nan_to_num(delta_fn(zbar)), inside.sum(axis=1)",
+     "a state's charge is the sum of delta over its ions, not delta(<z>)",
+     "test_two_ion_state_carries_the_sum_not_the_mean_position"),
+
+    ("bath species dropped from reaction charge", "delta.py",
+     "        z[t.reaction] += (0.0 if ds is None else float(ds)) \\",
+     "        z[t.reaction] += 0.0 * (0.0 if ds is None else float(ds)) \\",
+     "charge closure follows from bath stoichiometry",
+     "test_closure_follows_from_stoichiometry_for_any_state_charges"),
+
+    ("WE weights ignored", "delta.py",
+     "    w = np.ones(len(Qf)) if weights is None else np.asarray(weights, float)",
+     "    w = np.ones(len(Qf))",
+     "weighted-ensemble weights enter the state charge",
+     "test_we_weights_enter_as_weights"),
 ]
 
 
