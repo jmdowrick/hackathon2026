@@ -338,7 +338,8 @@ def permeation_graph(D_filter, max_barrier_kJ=10.5, temperature=298.0,
                      c_in=140.0, c_out=4.0, sites=None, F_profile=None,
                      z_profile=None, radius_profile=None,
                      radius_z=None, field="geometry", include_cavity=False,
-                     cavity_F_kJ=None):
+                     cavity_F_kJ=None, include_empty=True, c_ref=100.0,
+                     empty_F_kJ=0.0):
     """Site states -> electrogenic bond graph with an I-V curve.
 
     RATES COME FROM THE BARRIER, NOT THE ENDPOINT FREE ENERGIES.
@@ -480,6 +481,49 @@ def permeation_graph(D_filter, max_barrier_kJ=10.5, temperature=298.0,
     # which is the physically right thing and matters as soon as the domain
     # includes the wide cavity -- there the narrow filter carries ~90% of the
     # potential drop rather than its length-share.
+    species = {"K_in": Species("K_in", 1.0, float(c_in)),
+               "K_out": Species("K_out", 1.0, float(c_out)),
+               "K_ref": Species("K_ref", 1.0, float(c_ref))}
+
+    if include_empty:
+        # AN EXPLICIT EMPTY STATE, so bath concentration can change how
+        # LOADED the filter is.
+        #
+        # Without it, steady_state constrains sum(x) = 1: the filter always
+        # holds exactly one ion's worth of occupancy whatever the bath
+        # concentration, and under symmetric conditions the chemostat
+        # affinity RT ln(c_in/c_out) is zero, so concentration cancels
+        # entirely. I-V curves at 20 and 400 mM then came out BIT-IDENTICAL.
+        #
+        # With it the cycle is E -> S0 -> ... -> S4 -> E, binding draws from
+        # the outside bath and release deposits into the inside one, so
+        # occupancy and hence conductance saturate with [K+] as a real
+        # channel does. The two affinities still sum to RT ln(c_out/c_in)
+        # around the cycle, so the reversal potential is unchanged.
+        names = names + ["E"]
+        n = len(names)
+        F = np.append(F, float(empty_F_kJ))
+        zpos = np.append(zpos, zpos[0])        # E carries no field distance
+        edges = np.array([[i, i + 1] for i in range(n - 2)]
+                         + [[n - 2, n - 1], [n - 1, 0]])
+        kf = list(kf[:n - 2]) + [kf[-1], kf[-1]]
+        kr = list(kr[:n - 2]) + [kr[-1], kr[-1]]
+        # ORIENTATION. names runs intracellular -> extracellular, so the
+        # chain S4 -> ... -> S0 carries the ion OUTWARD; edge [n-2, n-1] is
+        # then S0 -> E, a release to the OUTSIDE, and edge [n-1, 0] is
+        # E -> S4, binding from the INSIDE. Getting these the wrong way round
+        # flips the reversal potential and inverts the concentration
+        # dependence of the conductance while leaving everything else
+        # looking plausible.
+        r_release_out, r_bind_in = n - 2, n - 1
+        transits = [Transit(reaction=r_release_out, source="K_ref",
+                            sink="K_out"),
+                    Transit(reaction=r_bind_in, source="K_in",
+                            sink="K_ref")]
+    else:
+        transits = None
+
+    # (delta is computed below over the final zpos, including E if present)
     if field == "geometry":
         if radius_profile is None:
             radius_z = np.linspace(min(zpos.min(), -20.0), zpos.max(), 600)
@@ -492,11 +536,27 @@ def permeation_graph(D_filter, max_barrier_kJ=10.5, temperature=298.0,
     else:
         delta = electrical_distances(zpos, zpos.min(), zpos.max())
         field_note = "uniform-field assumption (declared simplification)"
-    z = reaction_charges(delta, edges, z_ion=1.0)
+    if include_empty:
+        # ASSIGN THE CHARGES EXPLICITLY. Telescoping delta over a state list
+        # that contains E gives [.., -1, +1]: the bath steps carry a whole
+        # charge each and the filter traversal carries none, which is upside
+        # down. E has no ion, so it has no electrical position -- and it is
+        # reached from BOTH faces, so no single delta can be right.
+        #
+        # Physically the bath steps move an ion between a reservoir and the
+        # adjacent site at the SAME membrane face, traversing ~none of the
+        # field; the charge moves as the ion crosses the filter. So the
+        # filter hops telescope to +1 and both bath steps carry 0.
+        z = np.zeros(len(edges))
+        for r, (i, j) in enumerate(edges[:len(edges) - 2]):
+            z[r] = delta[j] - delta[i]
+        z[:len(edges) - 2] *= 1.0 / max(z[:len(edges) - 2].sum(), 1e-12)
+    else:
+        z = reaction_charges(delta, edges, z_ion=1.0)
 
-    species = {"K_in": Species("K_in", 1.0, float(c_in)),
-               "K_out": Species("K_out", 1.0, float(c_out))}
-    transits = [Transit(reaction=len(edges) - 1, source="K_in", sink="K_out")]
+    if transits is None:
+        transits = [Transit(reaction=len(edges) - 1,
+                            source="K_in", sink="K_out")]
 
     bg = ElectroBondGraph.from_rates(np.array(kf), np.array(kr), edges, z,
                                      F_states=F, temperature=temperature,

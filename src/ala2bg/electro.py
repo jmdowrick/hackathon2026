@@ -250,8 +250,24 @@ class ElectroBondGraph:
         return np.exp(np.clip(arg, -300, 300))
 
     def fluxes(self, x, V=0.0):
+        """Marcelin-de Donder flux with a SYMMETRIC driving-force split.
+
+            v = kappa ( K_a x_a e^{+d/2} - K_b x_b e^{-d/2} ),
+            d = (z_r F V + A_r) / RT
+
+        The asymmetric form, e^{+d} on the forward term alone, has the same
+        equilibrium condition and so gives the same reversal potential -- but
+        it folds the driving force into the PREFACTOR. For a chemostat
+        affinity A = RT ln(c_ref/c) that makes the release rate scale as
+        1/c, so conductance FELL with permeant-ion concentration instead of
+        saturating, and I-V curves inverted. The symmetric split moves the
+        same ratio into both directions and leaves the rate constant alone.
+        This is the same +-1/2 convention the Bicout-Szabo discretisation
+        uses elsewhere in this package.
+        """
         a, b = self.edges[:, 0], self.edges[:, 1]
-        return self.kappa * (self.K[a] * x[a] * self._boltz(V) - self.K[b] * x[b])
+        h = np.sqrt(self._boltz(V))
+        return self.kappa * (self.K[a] * x[a] * h - self.K[b] * x[b] / h)
 
     def dxdt(self, x, V=0.0):
         return self.incidence() @ self.fluxes(x, V)
@@ -268,14 +284,14 @@ class ElectroBondGraph:
         """
         n, m = self.n_states, self.n_reactions
         a, b = self.edges[:, 0], self.edges[:, 1]
-        bz = self._boltz(V)
+        bz = np.sqrt(self._boltz(V))        # symmetric split, see fluxes()
 
         # dx/dt = A x with A assembled from the linear flux form
         A = np.zeros((n, n))
         for r in range(m):
             i, j = a[r], b[r]
             kf = self.kappa[r] * self.K[i] * bz[r]      # i -> j
-            kr = self.kappa[r] * self.K[j]              # j -> i
+            kr = self.kappa[r] * self.K[j] / bz[r]      # j -> i
             A[j, i] += kf; A[i, i] -= kf
             A[i, j] += kr; A[j, j] -= kr
 

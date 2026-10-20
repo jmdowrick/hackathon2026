@@ -13,9 +13,9 @@ than from fitting curves to experimental data.
 
 There is a gap in the middle of that ambition. Simulations describe where every
 atom is, millions of times per second. Physiological models describe whole cells
-and organs. **This project builds the bridge: it takes a molecular simulation and
+and organs. This project builds the bridge: it takes a molecular simulation and
 produces a small, runnable model of the protein's function that a cell-level
-model can use directly.**
+model can use directly.
 
 Three ideas make it work.
 
@@ -28,7 +28,7 @@ data rather than fitting it to the answer we want.
 created from nothing, and a system at rest cannot spontaneously start doing work.
 Most machine-learning models are free to violate such laws and are penalised when
 they do. Here they are built into the structure of the model, so they hold
-*exactly*, for any settings, at any point in training. The model literally cannot
+exactly, for any settings, at any point in training. The model literally cannot
 produce a current from nothing.
 
 **3. Produce something other people can use.** The output is a standard file

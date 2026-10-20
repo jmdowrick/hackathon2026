@@ -56,9 +56,12 @@ def simulate_learned(model, D_const, n_walkers=2000, n_steps=20_000, dt=1.0,
     network gradient evaluation per step regardless of walker count. Returns
     (X, traj_id) in the same contract every other estimator consumes.
 
-    dt here is the SURROGATE timestep in the same time unit as the D used to
-    fit the model (ps if D is rad^2/ps). It need not equal the MD frame
-    spacing -- it only has to be small enough for Euler-Maruyama.
+    dt here is the SURROGATE integration timestep, in the same time unit as
+    the D used to fit the model (ps if D is rad^2/ps). It need not equal the
+    MD frame spacing -- it only has to be small enough for Euler-Maruyama.
+
+    Returns (X, traj_id, dt_frames) where dt_frames = stride*dt is the SAVED
+    frame spacing. Use dt_frames downstream, never dt.
     """
     import torch
 
@@ -93,7 +96,13 @@ def simulate_learned(model, D_const, n_walkers=2000, n_steps=20_000, dt=1.0,
     out = out[:k]
     X = np.concatenate([out[:, w, :] for w in range(n_walkers)]).astype(np.float64)
     tid = np.concatenate([np.full(len(out), w) for w in range(n_walkers)])
-    return wrap(X), tid
+
+    # RETURN THE EFFECTIVE FRAME SPACING. Frames are saved every `stride`
+    # integration steps, so the spacing is stride*dt, not dt. Returning only
+    # (X, tid) invited the caller to pass the raw dt downstream, which scales
+    # every rate, MFPT and timescale by `stride` -- a silent factor of 4 in
+    # the first validation run, on top of any real disagreement.
+    return wrap(X), tid, float(stride * dt)
 
 
 def assign_states(X, centers):
