@@ -1623,10 +1623,80 @@ def test_structure_sites_match_the_assumed_ones_where_they_should():
     import os
     if not os.path.exists("data/1K4C.pdb"):
         pytest.skip("1K4C not cached; run scripts or allow network")
-    sites, _ = kcsa.sites_from_structure("1K4C")
+    # kcsa.SITES is S2-centred, so compare in that frame, not the default
+    # trajectory frame -- the two differ by 5.89 A.
+    sites, _ = kcsa.sites_from_structure("1K4C", centre_on="S2")
     for name, tol in [("S4", 0.3), ("S3", 0.3), ("S1", 0.3)]:
         assert abs(sites[name] - kcsa.SITES[name]) < tol, (
             f"{name}: measured {sites[name]:.2f} vs assumed {kcsa.SITES[name]}")
     assert sites["S0"] - kcsa.SITES["S0"] > 1.0, (
         "S0 should sit further out than a uniform 3.3 A spacing implies; "
         f"measured {sites['S0']:.2f} vs assumed {kcsa.SITES['S0']}")
+
+
+# ---------------------------------------------------------------------------
+# COORDINATE FRAMES. The trajectory and the structure must agree, and a
+# mismatch must be LOUD -- it was silent and worth 5.89 A, nearly two site
+# spacings, so every site read the landscape at roughly the wrong site.
+# ---------------------------------------------------------------------------
+
+def test_structure_sites_default_to_the_trajectory_frame():
+    """run_kcsa.py records z relative to the Thr75 CA ring centroid, so the
+    sites must default to that same origin -- not to a site-centred frame."""
+    from ala2bg import kcsa
+    import os
+    if not os.path.exists("data/1K4C.pdb"):
+        pytest.skip("1K4C not cached")
+    sites, meta = kcsa.sites_from_structure("1K4C")
+    assert "Thr75" in meta["frame"], meta["frame"]
+    # S2 must NOT be at the origin in this frame; that would be the other one
+    assert abs(sites["S2"]) > 3.0, (
+        f"S2 at {sites['S2']:.2f} suggests a site-centred frame, which does "
+        "not match the trajectory")
+    centred, _ = kcsa.sites_from_structure("1K4C", centre_on="S2")
+    assert abs(centred["S2"]) < 1e-9
+    off = sites["S2"] - centred["S2"]
+    assert abs(off) > 3.0, "the two frames should differ by ~5.9 A"
+
+
+def test_landscape_frame_mismatch_is_rejected():
+    """The guard that would have caught the bug.
+
+    A landscape that does not span the sites means the frames disagree.
+    Silently snapping each site to the nearest sampled point is the failure
+    mode: it always 'works' and is always wrong.
+    """
+    from ala2bg import kcsa
+    import os
+    if not os.path.exists("data/1K4C.pdb"):
+        pytest.skip("1K4C not cached")
+
+    # a landscape in the WRONG frame (S2-centred +-9 A) must be rejected
+    zp = np.linspace(-9, 9, 400)
+    with pytest.raises(ValueError, match="outside|frame"):
+        kcsa.permeation_graph_from_structure(0.02, F_profile=np.zeros_like(zp),
+                                             z_profile=zp)
+
+    # the correct frame must be accepted
+    sites, _ = kcsa.sites_from_structure("1K4C")
+    zs = np.array(sorted(sites.values()))
+    zp_ok = np.linspace(zs.min() - 2.5, zs.max() + 2.5, 400)
+    bg = kcsa.permeation_graph_from_structure(
+        0.02, F_profile=np.zeros_like(zp_ok), z_profile=zp_ok,
+        phnn_used=True, D_is_measured=True)
+    assert bg.n_states >= 5
+
+
+def test_sites_snap_tightly_onto_the_landscape_grid():
+    """Even within one frame, a coarse grid can misplace a site."""
+    from ala2bg import kcsa
+    import os
+    if not os.path.exists("data/1K4C.pdb"):
+        pytest.skip("1K4C not cached")
+    sites, _ = kcsa.sites_from_structure("1K4C")
+    zs = np.array(sorted(sites.values()))
+    # a grid too coarse to resolve the closest pair of sites must be refused
+    coarse = np.linspace(zs.min() - 2.5, zs.max() + 2.5, 6)
+    with pytest.raises(ValueError, match="resolve|snap|frame"):
+        kcsa.permeation_graph_from_structure(
+            0.02, F_profile=np.zeros_like(coarse), z_profile=coarse)

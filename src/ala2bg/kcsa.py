@@ -378,6 +378,36 @@ def permeation_graph(D_filter, max_barrier_kJ=10.5, temperature=298.0,
         phnn_used = None          # the caller must say; see from_trajectory
 
     # site free energies and the saddles between them, read off the profile
+    # The supplied landscape must COVER the sites. A frame mismatch between a
+    # learned landscape and the site positions is otherwise silent: every site
+    # snaps to the nearest sampled point, which may be a different site
+    # entirely. This is the check that would have caught a 5.89 A offset.
+    lo, hi = float(np.min(z_profile)), float(np.max(z_profile))
+    outside = [n for n, zz in zip(names, zpos) if not (lo <= zz <= hi)]
+    if outside:
+        raise ValueError(
+            f"landscape spans [{lo:.1f}, {hi:.1f}] A but sites {outside} lie "
+            f"outside it (sites at {np.round(zpos,2).tolist()}). This is "
+            "almost always a coordinate-frame mismatch between the trajectory "
+            "and the structure.")
+    # The grid must RESOLVE the sites. Testing the snap distance against the
+    # grid spacing cannot work: snapping to the nearest point is at most
+    # gap/2 by construction, so a threshold of 2*gap is unreachable and the
+    # check was dead code. The real requirement is that the spacing be fine
+    # relative to the closest pair of sites.
+    gap = float(np.max(np.abs(np.diff(np.sort(z_profile)))))
+    if len(zpos) > 1:
+        min_sep = float(np.min(np.diff(np.sort(zpos))))
+        if gap > 0.5 * min_sep:
+            raise ValueError(
+                f"landscape grid spacing {gap:.2f} A cannot resolve sites "
+                f"separated by {min_sep:.2f} A; use a finer z_profile")
+    snap = [float(np.min(np.abs(z_profile - zz))) for zz in zpos]
+    if max(snap) > 0.5:
+        raise ValueError(
+            f"sites snap up to {max(snap):.2f} A onto the landscape grid; "
+            "the frames do not line up")
+
     site_idx = [int(np.argmin(np.abs(z_profile - zz))) for zz in zpos]
     F = F_profile[site_idx].astype(float)
 
@@ -453,6 +483,7 @@ def permeation_graph(D_filter, max_barrier_kJ=10.5, temperature=298.0,
                     "field_model": field_note,
                     "cavity_included": bool("Scav" in names),
                     "cavity_F_parameterised": bool(cav_declared),
+                    "frame": "Thr75 CA plane" if F_profile is not None else "n/a",
                     "landscape_source": landscape_source,
                     "phnn_used": phnn_used,
                     "D_is_measured": False,
@@ -747,7 +778,7 @@ def kcsa_radius_model(z, filter_r=1.2, cavity_r=5.0, vestibule_r=3.5,
     return r
 
 
-def sites_from_structure(pdb_id="1K4C", cache_dir="data", centre_on="S2",
+def sites_from_structure(pdb_id="1K4C", cache_dir="data", centre_on=None,
                          names=("Scav", "S4", "S3", "S2", "S1", "S0", "Sext")):
     """Site positions MEASURED from resolved K+ ions in a PDB structure.
 
@@ -769,10 +800,20 @@ def sites_from_structure(pdb_id="1K4C", cache_dir="data", centre_on="S2",
 
     use = names[:len(z)]
     sites = dict(zip(use, z))
+
+    # FRAME. centre_on=None keeps the Thr75 CA plane origin, which is the
+    # frame run_kcsa.py records trajectories in (it recomputes the ring
+    # centroid every frame). Centring on a site instead shifts everything by
+    # that site's position -- 5.89 A for S2, nearly two site spacings -- so a
+    # landscape learned from a trajectory would be read at the wrong sites
+    # with no error raised anywhere.
     if centre_on in sites:
         off = sites[centre_on]
         sites = {k: float(v - off) for k, v in sites.items()}
-    return sites, r
+    r = dict(r)
+    r["frame"] = ("Thr75 CA plane (matches run_kcsa.py)" if centre_on is None
+                  else f"centred on {centre_on}")
+    return {k: float(v) for k, v in sites.items()}, r
 
 
 def permeation_graph_from_structure(D_filter, pdb_id="1K4C", cache_dir="data",
@@ -791,13 +832,13 @@ def permeation_graph_from_structure(D_filter, pdb_id="1K4C", cache_dir="data",
     The flags are explicit and unset by default on purpose: a model is only
     labelled as derived when something derived it.
     """
-    sites, r = sites_from_structure(pdb_id, cache_dir)
+    sites, r = sites_from_structure(pdb_id, cache_dir, centre_on=None)
     sites = {k: v for k, v in sites.items() if k in use_sites}
 
-    # centre the measured radius profile on the same origin as the sites
-    _, raw = sites_from_structure(pdb_id, cache_dir)
-    off = float(np.asarray(raw["ion_z_A"], float)[3])
-    rz = np.asarray(r["radius_z_A"], float) - off
+    # Radius profile is already in the Thr75 CA frame, the same as the sites
+    # and the same as the trajectory. No offset -- applying one here was the
+    # other half of the frame bug.
+    rz = np.asarray(r["radius_z_A"], float)
     rr = np.asarray(r["radius_A"], float)
 
     bg = permeation_graph(D_filter, sites=sites, field="geometry",

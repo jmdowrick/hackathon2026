@@ -290,7 +290,14 @@ def analyse():
           f"lag stability {stab['max_ratio']:.2f} (markovian {stab['markovian']})")
 
     try:
-        learned = kcsa.learn_landscape(Z, dt, steps=3000)
+        # Window chosen to cover the measured sites IN THE TRAJECTORY FRAME
+        # (Thr75 CA plane), not the default +-9 A, which would clip the
+        # cavity at -7.7 and everything above S1 at +9.3.
+        sites, _ = kcsa.sites_from_structure(centre_on=None)
+        zs = np.array(sorted(sites.values()))
+        learned = kcsa.learn_landscape(Z, dt, steps=3000,
+                                       z_min=float(zs.min()) - 2.5,
+                                       z_max=float(zs.max()) + 2.5)
         bg = kcsa.permeation_graph_from_structure(
             Dm["D_global"], F_profile=learned["F"], z_profile=learned["z"],
             phnn_used=True, D_is_measured=True)
