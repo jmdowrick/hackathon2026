@@ -1269,8 +1269,9 @@ def test_cellml_numbers_match_the_python_model():
         for r, (a, b) in enumerate(bg.edges):
             z = vals[f"z_{r}"][0]
             drive = z * Far * V + (mu_in - mu_out if r == last else 0.0)
+            h = np.exp(drive / vals["RT2"][0])   # symmetric split
             tot += z * vals[f"kappa_{r}"][0] * (
-                K[a] * q[a] * np.exp(drive / RT) - K[b] * q[b])
+                K[a] * q[a] * h - K[b] * q[b] / h)
         assert np.isclose(q_e * tot, bg.current(q, V), rtol=1e-8, atol=1e-25), (
             f"emitted CellML current disagrees at V={V}: "
             f"{q_e*tot:.4e} vs {bg.current(q, V):.4e}")
@@ -1330,7 +1331,8 @@ def test_potassium_is_an_explicit_variable_not_a_baked_constant():
     import tempfile, os
 
     bg = kcsa.permeation_graph(0.02, c_in=140.0, c_out=4.0)
-    assert set(bg.species) == {"K_in", "K_out"}
+    # K_ref is the standard-state reference for the binding/release steps
+    assert {"K_in", "K_out"} <= set(bg.species)
     v0 = bg.reversal_potential()
     bg.set_concentration("K_out", 140.0)
     v1 = bg.reversal_potential()

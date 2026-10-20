@@ -150,7 +150,8 @@ def write_cellml(bg, path, model_name="bond_graph_model", max_states=None,
         used += ["kJ_per_mol_per_V", "C_per_mol"]
 
     # --- variables ---------------------------------------------------------
-    v = [_var("t", "second"), _var("RT", "kJ_per_mol", RT)]
+    v = [_var("t", "second"), _var("RT", "kJ_per_mol", RT),
+         _var("RT2", "kJ_per_mol", 2.0 * RT)]
     if electro:
         v += [_var("V", "volt", 0.0),
               _var("Far", "kJ_per_mol_per_V", FARADAY_kJ_per_mol_per_V)]
@@ -203,6 +204,7 @@ def write_cellml(bg, path, model_name="bond_graph_model", max_states=None,
 
     for r, (a, b) in enumerate(bg.edges):
         fwd = _apply("times", _ci(f"K_{lab[a]}"), _ci(f"q_{lab[a]}"))
+        rev_scale = None
         if electro:
             # exp((z_r Far V + A_r) / RT)
             drive = _apply("times", _ci(f"z_{r}"), _ci("Far"), _ci("V"))
@@ -214,9 +216,21 @@ def write_cellml(bg, path, model_name="bond_graph_model", max_states=None,
                 drive = _apply("plus", drive,
                                _apply("minus", _ci(f"mu_{sp_map[t.source]}"),
                                       _ci(f"mu_{sp_map[t.sink]}")))
-            fwd = _apply("times", fwd,
-                         _apply("exp", _apply("divide", drive, _ci("RT"))))
+            # SYMMETRIC SPLIT, matching electro.fluxes(): e^{+d/2} on the
+            # forward term and e^{-d/2} on the reverse. Emitting e^{+d} on the
+            # forward alone has the same equilibrium condition -- so the
+            # reversal potential still looks right -- but folds the driving
+            # force into the prefactor, and the exported model then disagrees
+            # with the Python one. Any change to fluxes() must be mirrored
+            # here; test_cellml_numbers_match_the_python_model catches it.
+            # 2RT is declared as a variable rather than an inline MathML
+            # constant: this writer builds XML as text and has no <cn> helper.
+            half = _apply("divide", drive, _ci("RT2"))
+            fwd = _apply("times", fwd, _apply("exp", half))
+            rev_scale = _apply("exp", _apply("minus", half))
         rev = _apply("times", _ci(f"K_{lab[b]}"), _ci(f"q_{lab[b]}"))
+        if rev_scale is not None:
+            rev = _apply("times", rev, rev_scale)
         eqs.append(_eq(_ci(f"v_{r}"),
                        _apply("times", _ci(f"kappa_{r}"),
                               _apply("minus", fwd, rev))))
