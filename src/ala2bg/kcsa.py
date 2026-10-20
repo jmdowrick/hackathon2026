@@ -316,7 +316,8 @@ def load_from_mdtraj(traj, filter_resids=FILTER_RESIDUES, ion_name="K"):
 
 def permeation_graph(D_filter, max_barrier_kJ=10.5, temperature=298.0,
                      c_in=140.0, c_out=4.0, sites=None, F_profile=None,
-                     z_profile=None):
+                     z_profile=None, radius_profile=None,
+                     radius_z=None, field="uniform"):
     """Site states -> electrogenic bond graph with an I-V curve.
 
     RATES COME FROM THE BARRIER, NOT THE ENDPOINT FREE ENERGIES.
@@ -373,7 +374,23 @@ def permeation_graph(D_filter, max_barrier_kJ=10.5, temperature=298.0,
         kf.append(float(kramers_rate(Fs, F[i], D, h, temperature)) * 1e12)
         kr.append(float(kramers_rate(Fs, F[j], D, h, temperature)) * 1e12)
 
-    delta = electrical_distances(zpos, zpos.min(), zpos.max())
+    # Electrical distances. "uniform" is the textbook linear-field
+    # assumption; "geometry" derives them from the pore's resistance profile,
+    # which is the physically right thing and matters as soon as the domain
+    # includes the wide cavity -- there the narrow filter carries ~90% of the
+    # potential drop rather than its length-share.
+    if field == "geometry":
+        if radius_profile is None:
+            radius_z = np.linspace(min(zpos.min(), -20.0), zpos.max(), 600)
+            radius_profile = kcsa_radius_model(radius_z)
+        delta = electrical_distance_from_geometry(zpos, radius_z,
+                                                  radius_profile)
+        span = delta.max() - delta.min()
+        delta = (delta - delta.min()) / (span if span > 0 else 1.0)
+        field_note = "derived from the pore radius profile (resistive model)"
+    else:
+        delta = electrical_distances(zpos, zpos.min(), zpos.max())
+        field_note = "uniform-field assumption (declared simplification)"
     z = reaction_charges(delta, edges, z_ion=1.0)
 
     species = {"K_in": Species("K_in", 1.0, float(c_in)),
@@ -390,6 +407,9 @@ def permeation_graph(D_filter, max_barrier_kJ=10.5, temperature=298.0,
                     "saddles_kJ": [float(x) for x in saddles],
                     "D_used_A2_per_ps": D,
                     "rate_law": "Kramers over the resolved barrier",
+                    "delta": delta.tolist(),
+                    "z_per_reaction": z.tolist(),
+                    "field_model": field_note,
                     "landscape_source": landscape_source,
                     **provenance()})
     return bg
@@ -588,3 +608,93 @@ def states_from_trajectory(z_traj, dt, traj_id=None, z_min=-9.0, z_max=9.0,
                  "strongly metastable, which for equal-depth wells is "
                  "expected and is reported rather than overridden."),
     }
+
+
+# ---------------------------------------------------------------------------
+# Electrical distance from pore geometry, rather than a uniform field
+# ---------------------------------------------------------------------------
+
+def pore_radius_profile(protein_xyz, origin, axis, z_edges, probe_A=1.4):
+    """Pore radius along the axis: the HOLE-style minimum clearance per slab.
+
+    protein_xyz : (n_atoms, 3) heavy-atom coordinates, same units as z_edges
+    returns (n_bins,) radius, NaN where no atom lines the slab
+
+    Measured from the structure or trajectory, so the electrical distance
+    below is DERIVED rather than assumed. probe_A subtracts a probe radius so
+    the result is the clearance available to an ion, not the distance to atom
+    centres.
+    """
+    P = np.asarray(protein_xyz, float) - np.asarray(origin, float)
+    axis = np.asarray(axis, float)
+    axis = axis / np.linalg.norm(axis)
+
+    zc = P @ axis                                   # along the pore
+    perp = P - np.outer(zc, axis)
+    r = np.linalg.norm(perp, axis=1)                # distance from the axis
+
+    z_edges = np.asarray(z_edges, float)
+    idx = np.digitize(zc, z_edges) - 1
+    n = len(z_edges) - 1
+    out = np.full(n, np.nan)
+    for b in range(n):
+        sel = idx == b
+        if sel.any():
+            out[b] = max(float(r[sel].min()) - probe_A, 0.05)
+    return out
+
+
+def electrical_distance_from_geometry(z_query, z_profile, radius_profile,
+                                      min_radius_A=0.3):
+    """Woodhull electrical distance from the pore's resistance profile.
+
+    The uniform-field assumption, delta = (z - z0)/L, is linear in position
+    and physically wrong for a channel: the transmembrane potential drops
+    where the pore is NARROW and barely drops in the wide cavity and
+    vestibules. Treating the conduit as a resistor, the drop per unit length
+    goes as 1/A(z), so
+
+        delta(z) = Int_{z0}^{z} dz'/A(z')  /  Int_{z0}^{zL} dz'/A(z')
+
+    with A = pi r^2. The result is still normalised 0 -> 1, so the per-
+    reaction charges still telescope to exactly one elementary charge and
+    charge closure remains structural.
+
+    For KcsA this matters quantitatively. The filter is ~1.2 A in radius and
+    the central cavity ~5 A, an area ratio of ~17, so the filter should carry
+    most of the field drop while a uniform-field model spreads it evenly.
+    Reported geometric and electrophysiologically-fitted Woodhull distances
+    for KcsA blockers differ by roughly a factor of two, and this is the
+    leading candidate for that gap -- so the comparison is a falsifiable
+    prediction, not a calibration.
+    """
+    z_profile = np.asarray(z_profile, float)
+    r = np.asarray(radius_profile, float).copy()
+    r[~np.isfinite(r)] = np.nanmedian(r[np.isfinite(r)]) if np.isfinite(r).any() else 1.0
+    r = np.clip(r, min_radius_A, None)
+
+    inv_area = 1.0 / (np.pi * r ** 2)
+    cum = np.concatenate([[0.0], np.cumsum(0.5 * (inv_area[1:] + inv_area[:-1])
+                                           * np.diff(z_profile))])
+    if cum[-1] <= 0:
+        raise ValueError("degenerate resistance profile")
+    delta_profile = cum / cum[-1]
+    return np.interp(np.asarray(z_query, float), z_profile, delta_profile)
+
+
+def kcsa_radius_model(z, filter_r=1.2, cavity_r=5.0, vestibule_r=3.5,
+                      filter_half=6.6, cavity_centre=-13.0, cavity_half=4.0):
+    """Approximate KcsA pore radius, for use when no structure is to hand.
+
+    PARAMETERISED, not measured: the filter radius ~1.2 A (a dehydrated K+
+    just fits) and the water-filled cavity ~5 A are structural facts from the
+    1K4C-era literature, but this smooth interpolation between them is a
+    stand-in. Prefer pore_radius_profile() on a real structure or trajectory,
+    which is why that function exists.
+    """
+    z = np.asarray(z, float)
+    r = np.full_like(z, vestibule_r)
+    r = np.where(np.abs(z) <= filter_half, filter_r, r)
+    cav = np.abs(z - cavity_centre) <= cavity_half
+    r = np.where(cav, cavity_r, r)
+    return r

@@ -1464,3 +1464,90 @@ def test_measured_D_feeds_through_to_the_conductance():
     c_lo = g_lo.conductance(g_lo.reversal_potential())
     c_hi = g_hi.conductance(g_hi.reversal_potential())
     assert c_hi > 3 * c_lo, "conductance did not scale with the measured D"
+
+
+# ---------------------------------------------------------------------------
+# Electrical distance: uniform-field assumption vs pore geometry.
+# ---------------------------------------------------------------------------
+
+def test_geometric_electrical_distance_still_closes_charge():
+    """However delta is derived, the per-reaction charges must telescope to
+    exactly one elementary charge."""
+    from ala2bg import kcsa
+    from ala2bg.electro import reaction_charges
+    zs = np.array(sorted(kcsa.SITES.values()))
+    zp = np.linspace(-20, 9, 600)
+    rp = kcsa.kcsa_radius_model(zp)
+    d = kcsa.electrical_distance_from_geometry(zs, zp, rp)
+    d = (d - d.min()) / (d.max() - d.min())
+    e = np.array([[i, (i + 1) % len(zs)] for i in range(len(zs))])
+    z = reaction_charges(d, e, z_ion=1.0)
+    assert abs(z.sum() - 1.0) < 1e-12
+
+
+def test_narrow_regions_carry_more_of_the_field():
+    """The physical claim: potential drops where the pore is NARROW.
+
+    A uniform-field model spreads the drop by LENGTH, which over-weights the
+    wide cavity. Non-vacuous: the two models must give materially different
+    answers, and in the direction physics requires.
+    """
+    from ala2bg import kcsa
+    zp = np.linspace(-20.0, 9.0, 600)
+    rp = kcsa.kcsa_radius_model(zp)
+
+    z_cav, z_filt_lo, z_filt_hi = -13.0, -6.6, 6.6
+    d = kcsa.electrical_distance_from_geometry(
+        np.array([z_cav, z_filt_lo, z_filt_hi]), zp, rp)
+
+    filter_share = float(d[2] - d[1])
+    cavity_share = float(d[1] - d[0])
+    # the filter is ~12 A of a ~29 A span but should carry most of the drop
+    assert filter_share > 0.75, \
+        f"narrow filter carried only {filter_share:.2f} of the field"
+    assert cavity_share < 0.15, \
+        f"wide cavity carried {cavity_share:.2f} of the field; too much"
+
+    # and it must DIFFER from the uniform assumption, else nothing was gained.
+    # Observed: geometric 0.904 vs uniform 0.455, a factor of 1.99.
+    uni_filter = (z_filt_hi - z_filt_lo) / (9.0 - (-20.0))
+    assert filter_share > 1.5 * uni_filter, (
+        f"geometric share {filter_share:.3f} vs uniform {uni_filter:.3f} -- "
+        "the two models barely differ")
+
+
+def test_pore_radius_profile_measures_a_known_geometry():
+    """Non-vacuous: a synthetic pore with a known constriction."""
+    from ala2bg import kcsa
+    rng = np.random.default_rng(0)
+    zs, atoms = [], []
+    for z in np.linspace(-10, 10, 200):
+        r = 1.5 if abs(z) < 4 else 5.0          # narrow waist in the middle
+        for th in np.linspace(0, 2 * np.pi, 24, endpoint=False):
+            atoms.append([r * np.cos(th), r * np.sin(th), z])
+    atoms = np.array(atoms)
+    edges = np.linspace(-10, 10, 21)
+    prof = kcsa.pore_radius_profile(atoms, [0, 0, 0], [0, 0, 1], edges,
+                                    probe_A=0.0)
+    centres = 0.5 * (edges[1:] + edges[:-1])
+    waist = prof[np.abs(centres) < 3]
+    wide = prof[np.abs(centres) > 6]
+    assert np.allclose(waist, 1.5, atol=0.2), f"waist measured {waist}"
+    assert np.allclose(wide, 5.0, atol=0.3), f"wide region measured {wide}"
+
+
+def test_field_model_choice_changes_the_charges():
+    """If selecting a field model changes nothing, the option is decorative."""
+    from ala2bg import kcsa
+    sites = {"Scav": -13.0, **kcsa.SITES}
+    uni = kcsa.permeation_graph(0.02, field="uniform", sites=sites)
+    geo = kcsa.permeation_graph(0.02, field="geometry", sites=sites)
+    zu = np.array(uni.meta["z_per_reaction"])
+    zg = np.array(geo.meta["z_per_reaction"])
+    assert abs(zu.sum() - 1) < 1e-9 and abs(zg.sum() - 1) < 1e-9
+    assert np.abs(zu - zg).max() > 0.1, \
+        "the two field models gave essentially the same charges"
+    # the cavity step must shrink under the geometric model
+    assert zg[0] < 0.3 * zu[0], \
+        f"cavity step charge {zg[0]:.3f} vs uniform {zu[0]:.3f}"
+    assert "field_model" in geo.meta
